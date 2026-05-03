@@ -13,7 +13,7 @@ from typing import List, Optional
 import config
 from timor_leste_config import build_timor_leste_network, add_loads_to_network
 from pypsa_setup import add_solar_pv, add_wind_farm, add_battery_storage
-from src.scenarios import extended_vre_trace, build_demand_growth_profile, apply_scenario_config
+from src.scenarios import build_demand_growth_profile, apply_scenario_config
 
 
 # ============================================================================
@@ -28,7 +28,8 @@ def create_multiindex_snapshots(
 ) -> pd.MultiIndex:
     """
     Build a (period, timestep) MultiIndex covering start_year through end_year.
-    February 29 is removed so every year is exactly 8760 hourly timesteps.
+    February 29 is removed so every model year has the same number of timesteps
+    for the selected frequency.
 
     Parameters
     ----------
@@ -43,10 +44,13 @@ def create_multiindex_snapshots(
     -------
     pd.MultiIndex with names ('period', 'timestep').
     """
+    start = pd.Timestamp(year=start_year, month=1, day=1)
+    exclusive_end = pd.Timestamp(year=end_year + 1, month=1, day=1)
     date_range = pd.date_range(
-        start=f"{start_year}-01-01",
-        end=f"{end_year}-12-31 23:00",
+        start=start,
+        end=exclusive_end,
         freq=freq,
+        inclusive="left",
     )
     # Remove Feb 29
     date_range = date_range[~((date_range.month == 2) & (date_range.day == 29))]
@@ -224,11 +228,112 @@ def get_annualized_capex(technology: str, build_year: int, discount_rate: float 
 # Time-series builders
 # ============================================================================
 
+def _fixed_frequency_timedelta(freq: str) -> pd.Timedelta:
+    """Return the Timedelta for a fixed pandas frequency string."""
+    offset = pd.tseries.frequencies.to_offset(freq)
+    try:
+        return pd.Timedelta(offset)
+    except ValueError as exc:
+        raise ValueError(f"Frequency '{freq}' must be fixed-width for this model workflow.") from exc
+
+
+def _validate_vre_frequency(freq: str) -> pd.Timedelta:
+    """
+    Validate the model frequency against Renewables Ninja trace resolution.
+
+    Renewables Ninja exports used here are hourly. Sub-hourly model frequencies
+    are therefore not supported until matching sub-hourly VRE inputs are added.
+    """
+    freq_delta = _fixed_frequency_timedelta(freq)
+    if freq_delta < pd.Timedelta(hours=1):
+        raise ValueError(
+            "Sub-hourly model frequencies are not supported by the current "
+            "Renewables Ninja CSV inputs. Use FREQ='1h' or a coarser fixed "
+            "frequency such as '2h'."
+        )
+    return freq_delta
+
+
+def load_renewables_ninja_trace(
+    csv_path: str,
+    target_timezone: str = "Asia/Dili",
+) -> pd.DataFrame:
+    """
+    Load an hourly Renewables Ninja trace and convert UTC timestamps to local time.
+
+    The source CSV timestamps are UTC. Each timestamp is converted to
+    Timor-Leste local clock time, then mapped onto a clean representative local
+    year so Jan 1 00:00 through Dec 31 23:00 are available for tiling.
+    """
+    raw = pd.read_csv(csv_path)
+    required = {"Time", "Output"}
+    if not required.issubset(raw.columns):
+        missing = ", ".join(sorted(required - set(raw.columns)))
+        raise ValueError(f"{csv_path} is missing required column(s): {missing}")
+
+    utc_time = pd.to_datetime(raw["Time"], dayfirst=True, utc=True)
+    local_time = utc_time.dt.tz_convert(target_timezone).dt.tz_localize(None)
+    base_year = int(local_time.dt.year.min())
+    canonical_local_time = pd.to_datetime(
+        local_time.dt.strftime(f"{base_year}-%m-%d %H:%M:%S")
+    )
+
+    trace = pd.DataFrame(
+        {"Output": pd.to_numeric(raw["Output"], errors="raise").to_numpy()},
+        index=canonical_local_time,
+    )
+    trace.index.name = "Time"
+    trace = trace.sort_index()
+
+    if trace.index.has_duplicates:
+        duplicate_count = int(trace.index.duplicated().sum())
+        raise ValueError(
+            f"{csv_path} produced {duplicate_count} duplicate local timestamps "
+            f"after conversion to {target_timezone}."
+        )
+
+    return trace
+
+
+def prepare_vre_trace_for_snapshots(
+    csv_path: str,
+    snapshots: pd.Index,
+    freq: str,
+    target_timezone: str = "Asia/Dili",
+) -> pd.Series:
+    """
+    Build a VRE capacity-factor series aligned to model snapshots.
+
+    Hourly Renewables Ninja data is used directly for 1h runs. For coarser
+    fixed frequencies, the trace is resampled by averaging. Sub-hourly model
+    frequencies are intentionally rejected.
+    """
+    freq_delta = _validate_vre_frequency(freq)
+    trace = load_renewables_ninja_trace(csv_path, target_timezone=target_timezone)
+
+    if freq_delta > pd.Timedelta(hours=1):
+        trace = trace.resample(freq).mean()
+
+    timestep_index = snapshots.get_level_values("timestep") if isinstance(snapshots, pd.MultiIndex) else snapshots
+    if len(trace) == 0:
+        raise ValueError(f"{csv_path} did not produce any VRE timesteps")
+
+    values = np.tile(trace["Output"].to_numpy(), int(np.ceil(len(timestep_index) / len(trace))))[:len(timestep_index)]
+    series = pd.Series(values, index=snapshots, name="Output")
+    if len(series) != len(timestep_index):
+        raise ValueError(
+            f"VRE trace length ({len(series)}) does not match network snapshots "
+            f"({len(timestep_index)}) after preparing {csv_path}."
+        )
+    return series
+
+
 def build_demand_profile(
     base_csv_path: str,
     start_year: int,
     end_year: int,
     growth_rate: float,
+    freq: str = "1h",
 ) -> pd.Series:
     """
     Load the base-year demand CSV and extend to the full model horizon.
@@ -247,6 +352,7 @@ def build_demand_profile(
         base_load_series=pd.Series(base_load),
         years=years,
         annual_growth_rate=growth_rate,
+        freq=freq,
     )
 
 
@@ -408,36 +514,18 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     # 5. Load Renewables Ninja CSV files
     # ------------------------------------------------------------------
-    solar_raw = pd.read_csv(solar_csv)["Output"].values  # 8760 floats
-    wind_raw = pd.read_csv(wind_csv)["Output"].values
-
-    base_ts = pd.date_range(start=f"{start_year}-01-01", periods=8760, freq="1h")
-    solar_base = pd.DataFrame({"Output": solar_raw}, index=base_ts)
-    wind_base = pd.DataFrame({"Output": wind_raw}, index=base_ts)
-
-    # Extend across full horizon
-    solar_extended = extended_vre_trace(
-        start_date=pd.Timestamp(f"{start_year}-01-01"),
-        end_date=pd.Timestamp(f"{end_year}-12-31 23:00"),
+    solar_cf = prepare_vre_trace_for_snapshots(
+        csv_path=solar_csv,
+        snapshots=snapshots,
         freq=config.FREQ,
-        trace_df=solar_base,
+        target_timezone="Asia/Dili",
     )
-    wind_extended = extended_vre_trace(
-        start_date=pd.Timestamp(f"{start_year}-01-01"),
-        end_date=pd.Timestamp(f"{end_year}-12-31 23:00"),
+    wind_cf = prepare_vre_trace_for_snapshots(
+        csv_path=wind_csv,
+        snapshots=snapshots,
         freq=config.FREQ,
-        trace_df=wind_base,
+        target_timezone="Asia/Dili",
     )
-
-    # Remove Feb 29 from extended traces
-    for df in [solar_extended, wind_extended]:
-        mask = ~((df.index.month == 2) & (df.index.day == 29))
-        df.drop(df.index[~mask], inplace=True)
-
-    # Re-index to network MultiIndex snapshots
-    timestep_index = snapshots.get_level_values("timestep")
-    solar_cf = pd.Series(solar_extended["Output"].values, index=snapshots)
-    wind_cf = pd.Series(wind_extended["Output"].values, index=snapshots)
 
     # ------------------------------------------------------------------
     # 6. Determine build years for new expandable generators
@@ -537,6 +625,7 @@ def build_multiperiod_network(
         start_year=start_year,
         end_year=end_year,
         growth_rate=scenario.get("demand_growth_rate", 0.03),
+        freq=config.FREQ,
     )
 
     # Load distribution matches timor_leste_config.add_loads_to_network
@@ -547,6 +636,11 @@ def build_multiperiod_network(
     }
 
     # Re-index demand profile to network's MultiIndex snapshots
+    if len(demand_profile) != len(snapshots):
+        raise ValueError(
+            f"Demand profile length ({len(demand_profile)}) does not match "
+            f"network snapshots ({len(snapshots)}). Check FREQ and demand CSV resolution."
+        )
     demand_indexed = pd.Series(demand_profile.values, index=snapshots)
 
     for bus, share in load_distribution.items():

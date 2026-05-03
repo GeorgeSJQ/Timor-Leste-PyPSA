@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from timor_leste_config import build_timor_leste_network, add_loads_to_network
 from pypsa_setup import add_solar_pv, add_wind_farm, add_battery_storage, add_generic_battery, battery_constraint
+from model_builder import prepare_vre_trace_for_snapshots
 from config import SNAPSHOTS_START, SNAPSHOTS_END, DISCOUNT_RATE , CAPITAL_COSTS, MARGINAL_COSTS, TECHNICAL_PARAMS, SOLVER_NAME
 
 # # Set random seed for reproducibility
@@ -43,29 +44,21 @@ def setup_network_for_optimization():
     
     print("\nImporting renewable energy profiles...")
     
-    # Read solar capacity factors
-    solar_data = pd.read_csv(r"data\solar_pv_output_re_ninja.csv")
+    solar_cf = prepare_vre_trace_for_snapshots(
+        csv_path=r"data\solar_pv_output_re_ninja.csv",
+        snapshots=snapshots,
+        freq="1h",
+        target_timezone="Asia/Dili",
+    )
+    wind_cf = prepare_vre_trace_for_snapshots(
+        csv_path=r"data\wind_output_re_ninja.csv",
+        snapshots=snapshots,
+        freq="1h",
+        target_timezone="Asia/Dili",
+    )
     
-    # Read wind capacity factors
-    wind_data = pd.read_csv(r"data\wind_output_re_ninja.csv")
-    
-    # If data length matches snapshots, use snapshots as index
-    if len(solar_data) == len(snapshots):
-        solar_data.index = snapshots.copy()
-        solar_data.index.name = snapshots.name
-        solar_data.drop(columns=['Time'], inplace=True)
-    else:
-        print("Trace data does not match snapshots length. Please check the input data.")
-    
-    if len(wind_data) == len(snapshots):
-        wind_data.index = snapshots.copy()
-        wind_data.index.name = snapshots.name
-        wind_data.drop(columns=['Time'], inplace=True)
-    else:
-        print("Trace data does not match snapshots length. Please check the input data.")
-    
-    print(f"  Solar CF: mean={solar_data['Output'].mean():.3f}, max={solar_data['Output'].max():.3f}")
-    print(f"  Wind CF:  mean={wind_data['Output'].mean():.3f}, max={wind_data['Output'].max():.3f}")
+    print(f"  Solar CF: mean={solar_cf.mean():.3f}, max={solar_cf.max():.3f}")
+    print(f"  Wind CF:  mean={wind_cf.mean():.3f}, max={wind_cf.max():.3f}")
     
     # ========================================================================
     # Add new generators and storage here
@@ -81,7 +74,7 @@ def setup_network_for_optimization():
         #p_nom=50,  # 50 MW
         capital_cost=CAPITAL_COSTS["solar"],
         marginal_cost=MARGINAL_COSTS["solar"],
-        p_max_pu=solar_data['Output'],
+        p_max_pu=solar_cf,
         p_nom_extendable=True,
     )
     
@@ -93,7 +86,7 @@ def setup_network_for_optimization():
         #p_nom=40,  # 40 MW
         capital_cost=CAPITAL_COSTS["wind_onshore"],
         marginal_cost=MARGINAL_COSTS["wind_onshore"],
-        p_max_pu=wind_data['Output'],
+        p_max_pu=wind_cf,
         wind_type="onshore",
         p_nom_extendable=True,
     )

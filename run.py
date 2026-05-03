@@ -113,28 +113,36 @@ def _run_single_year(solver_name: str) -> None:
 
     from timor_leste_config import build_timor_leste_network, add_loads_to_network
     from pypsa_setup import add_solar_pv, add_wind_farm, add_battery_storage
-    import pandas as pd
+    from model_builder import prepare_vre_trace_for_snapshots
 
     snapshots = pd.date_range(config.SNAPSHOTS_START, config.SNAPSHOTS_END, freq="1h")
     network = build_timor_leste_network(snapshots=snapshots, add_generators=True)
 
-    solar_data = pd.read_csv(r"data\solar_pv_output_re_ninja.csv")
-    wind_data = pd.read_csv(r"data\wind_output_re_ninja.csv")
-    solar_data.index = snapshots
-    wind_data.index = snapshots
+    solar_cf = prepare_vre_trace_for_snapshots(
+        csv_path=r"data\solar_pv_output_re_ninja.csv",
+        snapshots=snapshots,
+        freq="1h",
+        target_timezone="Asia/Dili",
+    )
+    wind_cf = prepare_vre_trace_for_snapshots(
+        csv_path=r"data\wind_output_re_ninja.csv",
+        snapshots=snapshots,
+        freq="1h",
+        target_timezone="Asia/Dili",
+    )
 
     add_solar_pv(
         network=network, name="Solar_Dili", bus="Dili",
         capital_cost=config.CAPITAL_COSTS["solar"],
         marginal_cost=config.MARGINAL_COSTS["solar"],
-        p_max_pu=solar_data["Output"],
+        p_max_pu=solar_cf,
         p_nom_extendable=True,
     )
     add_wind_farm(
         network=network, name="Wind_Lospalos", bus="Lospalos",
         capital_cost=config.CAPITAL_COSTS["wind_onshore"],
         marginal_cost=config.MARGINAL_COSTS["wind_onshore"],
-        p_max_pu=wind_data["Output"],
+        p_max_pu=wind_cf,
         wind_type="onshore",
         p_nom_extendable=True,
     )

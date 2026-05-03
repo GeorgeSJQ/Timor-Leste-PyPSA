@@ -14,6 +14,7 @@ def extended_vre_trace(
     end_date: pd.Timestamp,
     freq: str,
     trace_df: pd.DataFrame,
+    inclusive: str = "both",
 ) -> pd.DataFrame:
     """
     Extend a VRE capacity factor trace by tiling the original year across a new date range.
@@ -23,18 +24,20 @@ def extended_vre_trace(
     start_date : pd.Timestamp
         Start of the extended range.
     end_date : pd.Timestamp
-        End of the extended range (inclusive).
+        End of the extended range.
     freq : str
         Pandas frequency string (e.g. "1h").
     trace_df : pd.DataFrame
         Original single-year VRE trace with DatetimeIndex (8760 rows for hourly data).
+    inclusive : str
+        Passed to pd.date_range. Use "left" with an exclusive end boundary.
 
     Returns
     -------
     pd.DataFrame
         Extended DataFrame with tiled VRE patterns indexed by the new date range.
     """
-    target_range = pd.date_range(start=start_date, end=end_date, freq=freq)
+    target_range = pd.date_range(start=start_date, end=end_date, freq=freq, inclusive=inclusive)
 
     original_length = len(trace_df)
     if original_length == 0:
@@ -150,12 +153,14 @@ def build_demand_growth_profile(
     base_load_series: pd.Series,
     years: List[int],
     annual_growth_rate: float,
+    freq: str = "1h",
 ) -> pd.Series:
     """
     Extend a single-year hourly load profile across multiple years with compound growth.
 
     The load profile shape is preserved; only the magnitude scales year-on-year.
-    February 29 is excluded so every year has exactly 8760 hourly timesteps.
+    February 29 is excluded so every model year has the same number of timesteps
+    for the selected frequency.
 
     Parameters
     ----------
@@ -165,18 +170,49 @@ def build_demand_growth_profile(
         Ordered list of calendar years to cover.
     annual_growth_rate : float
         Compound annual growth rate (e.g. 0.03 for 3%).
+    freq : str
+        Fixed pandas frequency string. Source demand is hourly, so sub-hourly
+        frequencies are not supported. Coarser frequencies are averaged.
 
     Returns
     -------
     pd.Series
         Multi-year load profile with DatetimeIndex, Feb 29 excluded.
     """
+    offset = pd.tseries.frequencies.to_offset(freq)
+    try:
+        freq_delta = pd.Timedelta(offset)
+    except ValueError as exc:
+        raise ValueError(f"Frequency '{freq}' must be fixed-width for demand growth.") from exc
+
+    if freq_delta < pd.Timedelta(hours=1):
+        raise ValueError(
+            "Sub-hourly model frequencies are not supported by the current "
+            "hourly demand CSV input. Use '1h' or a coarser fixed frequency."
+        )
+
     base_year = years[0]
-    base_values = base_load_series.values
+    base_index = pd.date_range(
+        start=pd.Timestamp(year=base_year, month=1, day=1),
+        end=pd.Timestamp(year=base_year + 1, month=1, day=1),
+        freq="1h",
+        inclusive="left",
+    )
+    base_hourly = pd.Series(base_load_series.values, index=base_index)
+
+    if freq_delta > pd.Timedelta(hours=1):
+        base_profile = base_hourly.resample(freq).mean()
+    else:
+        base_profile = base_hourly
 
     all_series = []
     for year in years:
-        year_range = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31 23:00", freq="1h")
+        year_range = pd.date_range(
+            start=pd.Timestamp(year=year, month=1, day=1),
+            end=pd.Timestamp(year=year + 1, month=1, day=1),
+            freq=freq,
+            inclusive="left",
+        )
         # Remove Feb 29
         year_range = year_range[~((year_range.month == 2) & (year_range.day == 29))]
 
@@ -184,7 +220,7 @@ def build_demand_growth_profile(
         n_hours = len(year_range)
 
         # Tile/trim base values to exactly n_hours
-        tiled = np.tile(base_values, int(np.ceil(n_hours / len(base_values))))[:n_hours]
+        tiled = np.tile(base_profile.values, int(np.ceil(n_hours / len(base_profile))))[:n_hours]
         scaled = tiled * growth_factor
 
         all_series.append(pd.Series(scaled, index=year_range))
