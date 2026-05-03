@@ -115,8 +115,13 @@ def build_timor_leste_network(
     # Initialize network
     if snapshots is None:
         snapshots = pd.date_range("2025-01-01", periods=1, freq=f"{freq}h")
+    if isinstance(snapshots, pd.MultiIndex):
+        model_start_year = int(snapshots.get_level_values("timestep").year.min())
+    else:
+        model_start_year = int(pd.Index(snapshots).year.min())
     
     network = pypsa.Network(snapshots=snapshots)
+    network.snapshots.name = "snapshot"
     network.name = "Timor Leste Grid"
     
     print("Building Timor Leste electricity network...")
@@ -205,6 +210,7 @@ def build_timor_leste_network(
             s_nom=line_params["s_nom"],
             capital_cost=CAPITAL_COSTS.get("line", 1000) * length,
             terrain_factor=1.0,
+            build_year=model_start_year,
             lifetime=50,
             
         )
@@ -262,6 +268,8 @@ def build_timor_leste_network(
     print(f"Generators:                 {len(network.generators)}")
     print(f"Total generation capacity:  {network.generators.p_nom.sum():.1f} MW")
     print("="*70)
+
+    network.snapshots.name = "snapshot"
     
     return network
 

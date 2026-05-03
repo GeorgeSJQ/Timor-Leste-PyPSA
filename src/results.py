@@ -44,8 +44,11 @@ def calculate_system_lcoe(n: pypsa.Network) -> float:
         else:
             return np.nan
 
+        total_costs_sum = total_costs.sum() if hasattr(total_costs, "sum") else total_costs
         total_load_sum = total_load.sum() if hasattr(total_load, "sum") else total_load
-        return total_costs / total_load_sum if total_load_sum > 0 else np.nan
+        total_costs_sum = float(total_costs_sum)
+        total_load_sum = float(total_load_sum)
+        return total_costs_sum / total_load_sum if total_load_sum > 0 else np.nan
 
     except Exception as e:
         print(f"Warning: system LCOE calculation failed: {e}")
@@ -184,27 +187,39 @@ def generate_multiperiod_overview(
 
     results = pd.Series(dtype=float)
 
+    def _collapse_metric(metric):
+        """Collapse multi-period statistic columns to one scalar per index row."""
+        if isinstance(metric, pd.DataFrame):
+            return metric.sum(axis=1)
+        return metric
+
     try:
         stats = n.statistics().groupby(level=1).sum()
 
         for short, full in [("CAPEX", "Capital Expenditure"), ("OPEX", "Operational Expenditure"), ("CAPACITY", "Optimal Capacity")]:
             if full in stats.columns:
-                results = pd.concat([results, stats[full].rename(lambda x: f"{x} {short}")])
+                metric = _collapse_metric(stats[full])
+                results = pd.concat([results, metric.rename(lambda x: f"{x} {short}")])
 
         if all(c in stats.columns for c in ["Capital Expenditure", "Operational Expenditure"]):
-            totex = stats["Capital Expenditure"] + stats["Operational Expenditure"]
+            totex = _collapse_metric(stats["Capital Expenditure"]) + _collapse_metric(stats["Operational Expenditure"])
             results = pd.concat([results, totex.rename(lambda x: f"{x} TOTEX")])
 
         gen_carriers = set(n.generators.carrier.unique())
 
         if "Curtailment" in stats.columns and "Supply" in stats.columns:
-            curtailment_rates = stats["Curtailment"] / (stats["Supply"] + stats["Curtailment"])
+            supply = _collapse_metric(stats["Supply"])
+            curtailment = _collapse_metric(stats["Curtailment"])
+            curtailment_rates = curtailment / (supply + curtailment)
             vre_only = curtailment_rates[curtailment_rates.index.isin(set(renewable_carriers) & gen_carriers)]
             results = pd.concat([results, vre_only.rename(lambda x: f"{x} CURTAILMENT").dropna()])
 
         if all(c in stats.columns for c in ["Supply", "Curtailment", "Optimal Capacity"]):
-            cf_avail = (stats["Supply"] + stats["Curtailment"]) / (stats["Optimal Capacity"] * 8760)
-            cf_actual = stats["Supply"] / (stats["Optimal Capacity"] * 8760)
+            supply = _collapse_metric(stats["Supply"])
+            curtailment = _collapse_metric(stats["Curtailment"])
+            capacity = _collapse_metric(stats["Optimal Capacity"])
+            cf_avail = (supply + curtailment) / (capacity * 8760)
+            cf_actual = supply / (capacity * 8760)
             vre_carriers_present = set(renewable_carriers) & gen_carriers
             results = pd.concat([
                 results,
@@ -214,12 +229,12 @@ def generate_multiperiod_overview(
 
         by_component = n.statistics().groupby(level=0).sum()
         if "Load" in by_component.index:
-            annual_load = abs(by_component.loc["Load", "Energy Balance"])
+            annual_load = abs(_collapse_metric(by_component.loc["Load", "Energy Balance"]))
             results["Total Load (MWh)"] = annual_load.sum() if hasattr(annual_load, "sum") else annual_load
 
             re_carriers_present = set(renewable_carriers) & set(stats.index)
             if re_carriers_present:
-                re_supply = stats.loc[list(re_carriers_present), "Energy Balance"].sum()
+                re_supply = _collapse_metric(stats.loc[list(re_carriers_present), "Energy Balance"]).sum()
                 re_load_sum = annual_load.sum() if hasattr(annual_load, "sum") else annual_load
                 results["Renewable Share"] = re_supply / re_load_sum if re_load_sum > 0 else np.nan
 

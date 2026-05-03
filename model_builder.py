@@ -71,7 +71,9 @@ def create_multiindex_snapshots(
             period = investment_periods[0] if year < investment_periods[0] else investment_periods[-1]
         periods.append(period)
 
-    return pd.MultiIndex.from_arrays([periods, date_range], names=["period", "timestep"])
+    snapshots = pd.MultiIndex.from_arrays([periods, date_range], names=["period", "timestep"])
+    snapshots.name = "snapshot"
+    return snapshots
 
 
 def calculate_investment_period_weightings(
@@ -115,6 +117,28 @@ def calc_snapshot_weightings(n: pypsa.Network) -> None:
     total_snapshots = len(n.snapshots)
     weighting = 8760 / (total_snapshots / n_years) if n_years > 0 else 1.0
     n.snapshot_weightings.loc[:, :] = weighting
+
+
+def normalize_snapshot_index_names(n: pypsa.Network) -> None:
+    """
+    Ensure PyPSA time-dependent tables expose a 'snapshot' xarray dimension.
+
+    PyPSA's optimisation code selects time-dependent data with ``snapshot=...``.
+    With MultiIndex snapshots, pandas/xarray otherwise names the dimension
+    ``dim_0`` unless the index has an overall name.
+    """
+    n.snapshots.name = "snapshot"
+    n.snapshot_weightings.index.name = "snapshot"
+
+    for component_name in n.components:
+        pnl_name = f"{component_name}_t"
+        if not hasattr(n, pnl_name):
+            continue
+        pnl = getattr(n, pnl_name)
+        for attr in pnl.keys():
+            data = pnl[attr]
+            if isinstance(data, (pd.DataFrame, pd.Series)):
+                data.index.name = "snapshot"
 
 
 def calc_custom_degradation(
@@ -346,6 +370,11 @@ def build_demand_profile(
     """
     raw = pd.read_csv(base_csv_path)
     base_load = raw["Demand"].values  # 8760 values
+    if len(base_load) != config.HOURS_PER_YEAR:
+        raise ValueError(
+            f"{base_csv_path} must contain exactly {config.HOURS_PER_YEAR} hourly "
+            f"demand values for the current demand tiling workflow; found {len(base_load)}."
+        )
 
     years = list(range(start_year, end_year + 1))
     return build_demand_growth_profile(
@@ -658,5 +687,7 @@ def build_multiperiod_network(
     print(f"  Loads:          {len(network.loads)}")
     print(f"  Buses:          {len(network.buses)}")
     print(f"  Lines:          {len(network.lines)}")
+
+    normalize_snapshot_index_names(network)
 
     return network

@@ -57,8 +57,9 @@ def _run_single_scenario(
 
     status = network.optimize(
         solver_name=solver_name,
-        multi_invest=True,
+        multi_investment_periods=True,
         log_to_console=False,
+        include_objective_constant=False,
     )
 
     elapsed = time.time() - t0

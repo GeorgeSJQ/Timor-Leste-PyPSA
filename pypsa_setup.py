@@ -210,6 +210,7 @@ def add_battery_storage(
         build_year=build_year,
         **kwargs
     )
+    network.storage_units_t.inflow[name] = pd.Series(0.0, index=network.snapshots)
 
 
 def add_ocgt(

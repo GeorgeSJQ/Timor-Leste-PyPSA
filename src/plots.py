@@ -20,6 +20,30 @@ import config
 # Internal helper
 # ============================================================================
 
+CAPACITY_TOL = 1e-6
+
+
+def _built_generator_mask(n: pypsa.Network) -> pd.Series:
+    """Return a boolean mask for generators with built or existing capacity."""
+    if n.generators.empty:
+        return pd.Series(dtype=bool)
+
+    if "p_nom_opt" in n.generators.columns:
+        capacity = n.generators["p_nom_opt"].fillna(n.generators["p_nom"])
+    else:
+        capacity = n.generators["p_nom"]
+
+    return capacity.abs() > CAPACITY_TOL
+
+
+def _built_generator_carriers(n: pypsa.Network) -> list:
+    """Return carriers with non-zero built or existing generator capacity."""
+    mask = _built_generator_mask(n)
+    if mask.empty:
+        return []
+    return n.generators.loc[mask, "carrier"].dropna().unique().tolist()
+
+
 def _filter_snapshots(n: pypsa.Network, start_date=None, end_date=None):
     """Return filtered snapshot index and boolean mask."""
     if isinstance(n.snapshots, pd.MultiIndex):
@@ -38,7 +62,7 @@ def _filter_snapshots(n: pypsa.Network, start_date=None, end_date=None):
         if end_date:
             snaps = snaps[snaps <= pd.Timestamp(end_date)]
         mask = n.snapshots.isin(snaps)
-        return snaps, mask.values
+        return snaps, np.asarray(mask, dtype=bool)
 
 
 def _build_dispatch_df(
@@ -57,7 +81,9 @@ def _build_dispatch_df(
     if vre_carriers is None:
         vre_carriers = config.RENEWABLE_CARRIERS
 
-    gen_data = n.generators_t.p.loc[filtered_snapshots]
+    built_mask = _built_generator_mask(n)
+    built_generators = n.generators.index[built_mask]
+    gen_data = n.generators_t.p.loc[filtered_snapshots, built_generators]
     if isinstance(gen_data.index, pd.MultiIndex):
         plot_index = gen_data.index.get_level_values("timestep")
     else:
@@ -66,16 +92,17 @@ def _build_dispatch_df(
     df = pd.DataFrame(index=plot_index)
 
     # Generation grouped by carrier
-    p_by_carrier = gen_data.T.groupby(n.generators.carrier).sum().T
+    p_by_carrier = gen_data.T.groupby(n.generators.loc[built_generators, "carrier"]).sum().T
     if isinstance(p_by_carrier.index, pd.MultiIndex):
         p_by_carrier.index = p_by_carrier.index.get_level_values("timestep")
     for carrier in p_by_carrier.columns:
-        df[carrier] = p_by_carrier[carrier].values
+        if p_by_carrier[carrier].abs().max() > CAPACITY_TOL:
+            df[carrier] = p_by_carrier[carrier].values
 
     # Curtailment
     if show_curtailment:
         for carrier in vre_carriers:
-            vre_gens = n.generators.index[n.generators.carrier == carrier]
+            vre_gens = built_generators[n.generators.loc[built_generators, "carrier"] == carrier]
             if len(vre_gens) == 0:
                 continue
             max_possible = pd.Series(0.0, index=plot_index)
@@ -83,9 +110,12 @@ def _build_dispatch_df(
                 p_max_data = n.generators_t.p_max_pu.loc[filtered_snapshots, gen] if gen in n.generators_t.p_max_pu else pd.Series(1.0, index=filtered_snapshots)
                 if isinstance(p_max_data.index, pd.MultiIndex):
                     p_max_data.index = p_max_data.index.get_level_values("timestep")
-                max_possible += p_max_data.values * n.generators.p_nom_opt[gen]
+                gen_capacity = n.generators.at[gen, "p_nom_opt"] if "p_nom_opt" in n.generators.columns else n.generators.at[gen, "p_nom"]
+                max_possible += p_max_data.values * gen_capacity
             actual = df.get(carrier, pd.Series(0.0, index=plot_index))
-            df[f"{carrier} (curtailed)"] = (max_possible.values - actual.values).clip(min=0)
+            curtailed = (max_possible.values - actual.values).clip(min=0)
+            if curtailed.max() > CAPACITY_TOL:
+                df[f"{carrier} (curtailed)"] = curtailed
 
     # Storage units
     if not n.storage_units.empty:
@@ -241,7 +271,9 @@ def plot_generator_output_heatmap(
 
     Data is averaged across all years in the date range.
     """
-    gen_data = n.generators_t.p.copy()
+    built_mask = _built_generator_mask(n)
+    built_generators = n.generators.index[built_mask]
+    gen_data = n.generators_t.p.loc[:, built_generators].copy()
     if gen_data.empty:
         return None
 
@@ -252,7 +284,7 @@ def plot_generator_output_heatmap(
     end_year = int(end_date.split("-")[0]) if end_date else gen_data.index[-1].year
 
     gen_data = gen_data[(gen_data.index.year >= start_year) & (gen_data.index.year <= end_year)]
-    carrier_gen = gen_data.T.groupby(n.generators.carrier).sum().T
+    carrier_gen = gen_data.T.groupby(n.generators.loc[built_generators, "carrier"]).sum().T
 
     if carrier not in carrier_gen.columns or carrier_gen[carrier].max() == 0:
         print(f"No generation data for carrier '{carrier}'.")
@@ -456,7 +488,9 @@ def plot_monthly_electric_production(
 
     Works for both single-period and multi-period networks.
     """
-    gen_t = n.generators_t.p.copy()
+    built_mask = _built_generator_mask(n)
+    built_generators = n.generators.index[built_mask]
+    gen_t = n.generators_t.p.loc[:, built_generators].copy()
     if isinstance(gen_t.index, pd.MultiIndex):
         gen_t.index = gen_t.index.get_level_values("timestep")
 
@@ -472,7 +506,7 @@ def plot_monthly_electric_production(
     gen_t = gen_t[(gen_t.index.year >= start_year) & (gen_t.index.year <= end_year)]
     weightings = weightings[(weightings.index.year >= start_year) & (weightings.index.year <= end_year)]
 
-    carrier_gen = gen_t.T.groupby(n.generators.carrier).sum().T
+    carrier_gen = gen_t.T.groupby(n.generators.loc[built_generators, "carrier"]).sum().T
     weighted = carrier_gen.mul(weightings, axis=0)
 
     # StorageUnit net charge
@@ -491,6 +525,8 @@ def plot_monthly_electric_production(
 
     fig = go.Figure()
     for carrier in monthly_avg.columns:
+        if monthly_avg[carrier].abs().max() <= CAPACITY_TOL:
+            continue
         color = n.carriers.loc[carrier, "color"] if carrier in n.carriers.index else None
         fig.add_trace(go.Bar(
             x=monthly_avg.index,
@@ -608,18 +644,13 @@ def save_all_plots(
     scenario_name : str
         Used for display in print messages only.
     dispatch_start, dispatch_end : str, optional
-        Date range for the dispatch plot (defaults to first 2 weeks).
+        Date range for the dispatch plot. Defaults to the full model horizon.
     """
     plots_dir = os.path.join(output_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-
-    if dispatch_start is None and len(n.snapshots) > 0:
-        if isinstance(n.snapshots, pd.MultiIndex):
-            first_ts = n.snapshots.get_level_values("timestep")[0]
-        else:
-            first_ts = n.snapshots[0]
-        dispatch_start = str(first_ts.date())
-        dispatch_end = str((first_ts + pd.Timedelta(days=13)).date())
+    for filename in os.listdir(plots_dir):
+        if filename.endswith(".html"):
+            os.remove(os.path.join(plots_dir, filename))
 
     plots = {
         "dispatch.html": lambda: create_dispatch_plot(n, dispatch_start, dispatch_end),
@@ -630,7 +661,7 @@ def save_all_plots(
     }
 
     # Per-carrier generator heatmaps
-    for carrier in n.generators.carrier.unique():
+    for carrier in _built_generator_carriers(n):
         plots[f"heatmap_{carrier}.html"] = lambda c=carrier: plot_generator_output_heatmap(n, c)
 
     # Storage SOC plots
