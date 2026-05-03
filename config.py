@@ -11,8 +11,8 @@ from pypsa.common import annuity
 # ============================================================================
 
 MODEL_START_YEAR = 2025
-MODEL_END_YEAR = 2045
-INVESTMENT_PERIODS = list(range(2025, 2046))
+MODEL_END_YEAR = 2046   # exclusive right boundary — last investment period is MODEL_END_YEAR - 1
+INVESTMENT_PERIODS = list(range(2025, 2046))   # 2025 through 2045 inclusive
 FREQ = "1h"
 
 # ============================================================================
@@ -306,19 +306,50 @@ CAPITAL_COSTS = {
 }
 
 # ============================================================================
-# MULTI-YEAR COST PROJECTION FACTORS
+# MULTI-YEAR COST PROJECTION SETS
 # ============================================================================
-# Multipliers relative to 2025 base BUILD_COSTS, keyed by year.
+# Each set is a dict of technology → {milestone_year: cost_multiplier}.
+# Multipliers are relative to 2025 base BUILD_COSTS.
 # Intermediate years are linearly interpolated by get_annualized_capex().
+#
+# To use a set, set "cost_projection" in a SCENARIOS entry to the set name,
+# e.g. "cost_projection": "optimistic".
+#
+# Set         RE cost decline assumption
+# ---------   ---------------------------------------------------
+# default     Moderate decline — broadly aligned with IEA WEO stated policies
+# optimistic  Aggressive decline — aligned with IEA WEO net-zero / IRENA targets
+# conservative Slow decline — assumes supply-chain constraints persist
 
-COST_PROJECTION_FACTORS = {
-    "solar":        {2025: 1.00, 2030: 0.85, 2035: 0.75, 2040: 0.68, 2045: 0.62},
-    "wind_onshore": {2025: 1.00, 2030: 0.92, 2035: 0.87, 2040: 0.83, 2045: 0.80},
-    "battery":      {2025: 1.00, 2030: 0.70, 2035: 0.55, 2040: 0.45, 2045: 0.40},
-    "battery_energy":{2025: 1.00, 2030: 0.70, 2035: 0.55, 2040: 0.45, 2045: 0.40},
-    "diesel":       {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
-    "OCGT":         {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+COST_PROJECTION_SETS = {
+    "default": {
+        "solar":         {2025: 1.00, 2030: 0.85, 2035: 0.75, 2040: 0.68, 2045: 0.62},
+        "wind_onshore":  {2025: 1.00, 2030: 0.92, 2035: 0.87, 2040: 0.83, 2045: 0.80},
+        "battery":       {2025: 1.00, 2030: 0.70, 2035: 0.55, 2040: 0.45, 2045: 0.40},
+        "battery_energy":{2025: 1.00, 2030: 0.70, 2035: 0.55, 2040: 0.45, 2045: 0.40},
+        "diesel":        {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+        "OCGT":          {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+    },
+    "optimistic": {
+        "solar":         {2025: 1.00, 2030: 0.78, 2035: 0.65, 2040: 0.56, 2045: 0.50},
+        "wind_onshore":  {2025: 1.00, 2030: 0.88, 2035: 0.80, 2040: 0.74, 2045: 0.70},
+        "battery":       {2025: 1.00, 2030: 0.60, 2035: 0.42, 2040: 0.32, 2045: 0.25},
+        "battery_energy":{2025: 1.00, 2030: 0.60, 2035: 0.42, 2040: 0.32, 2045: 0.25},
+        "diesel":        {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+        "OCGT":          {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+    },
+    "conservative": {
+        "solar":         {2025: 1.00, 2030: 0.93, 2035: 0.88, 2040: 0.84, 2045: 0.81},
+        "wind_onshore":  {2025: 1.00, 2030: 0.97, 2035: 0.94, 2040: 0.92, 2045: 0.90},
+        "battery":       {2025: 1.00, 2030: 0.82, 2035: 0.70, 2040: 0.62, 2045: 0.57},
+        "battery_energy":{2025: 1.00, 2030: 0.82, 2035: 0.70, 2040: 0.62, 2045: 0.57},
+        "diesel":        {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+        "OCGT":          {2025: 1.00, 2030: 1.00, 2035: 1.00, 2040: 1.00, 2045: 1.00},
+    },
 }
+
+# Convenience alias — used by single-year mode and any code that doesn't go through scenarios.
+COST_PROJECTION_FACTORS = COST_PROJECTION_SETS["default"]
 
 # ============================================================================
 # SCENARIO DEFINITIONS

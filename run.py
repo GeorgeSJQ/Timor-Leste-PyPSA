@@ -187,7 +187,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--end-year", type=int, default=config.MODEL_END_YEAR,
-        help=f"Model end year (default: {config.MODEL_END_YEAR})",
+        help=(
+            f"Exclusive right boundary of the model horizon (default: {config.MODEL_END_YEAR}). "
+            f"The last investment period is end-year minus 1. "
+            f"Example: --end-year 2031 covers 2025–2030."
+        ),
     )
     parser.add_argument(
         "--solver", default=config.SOLVER_NAME,
@@ -216,7 +220,7 @@ def main() -> None:
             sys.exit(1)
 
     print(f"Running {len(scenarios_to_run)} scenario(s): {scenarios_to_run}")
-    print(f"Horizon: {args.start_year}–{args.end_year}, Solver: {args.solver}")
+    print(f"Horizon: {args.start_year}–{args.end_year - 1}, Solver: {args.solver}")
 
     for sname in scenarios_to_run:
         _run_single_scenario(

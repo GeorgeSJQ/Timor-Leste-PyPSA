@@ -190,12 +190,26 @@ def get_annualized_cost(cost: float, lifetime: int, discount_rate: float) -> flo
     return cost * r / (1.0 - 1.0 / (1.0 + r) ** lifetime)
 
 
-def _interpolate_projection_factor(technology: str, year: int) -> float:
+def _interpolate_projection_factor(
+    technology: str,
+    year: int,
+    projection_set: str = "default",
+) -> float:
     """
-    Return the cost projection factor for a technology at a given year,
-    linearly interpolating between the milestone years in COST_PROJECTION_FACTORS.
+    Return the cost projection factor for a technology at a given year.
+
+    Linearly interpolates between milestone years in the named projection set
+    from config.COST_PROJECTION_SETS. Returns 1.0 if the technology or set
+    is not found.
     """
-    factors = config.COST_PROJECTION_FACTORS.get(technology)
+    sets = config.COST_PROJECTION_SETS
+    if projection_set not in sets:
+        raise ValueError(
+            f"Unknown cost_projection '{projection_set}'. "
+            f"Available sets: {sorted(sets.keys())}"
+        )
+
+    factors = sets[projection_set].get(technology)
     if factors is None:
         return 1.0
 
@@ -215,12 +229,18 @@ def _interpolate_projection_factor(technology: str, year: int) -> float:
     return 1.0
 
 
-def get_annualized_capex(technology: str, build_year: int, discount_rate: float = None) -> float:
+def get_annualized_capex(
+    technology: str,
+    build_year: int,
+    discount_rate: float = None,
+    projection_set: str = "default",
+) -> float:
     """
     Return the annualised capital cost for a technology in a given build year.
 
-    Applies the year-specific projection factor from COST_PROJECTION_FACTORS to
-    the 2025 base BUILD_COSTS, then annualises and adds FOM.
+    Applies the year-specific projection factor from the named cost projection
+    set in config.COST_PROJECTION_SETS to the 2025 base BUILD_COSTS, then
+    annualises with the annuity formula and adds FOM.
 
     Parameters
     ----------
@@ -230,6 +250,9 @@ def get_annualized_capex(technology: str, build_year: int, discount_rate: float 
         Year of investment.
     discount_rate : float, optional
         Defaults to config.DISCOUNT_RATE.
+    projection_set : str, optional
+        Name of the cost projection set (key in config.COST_PROJECTION_SETS).
+        Defaults to "default".
 
     Returns
     -------
@@ -239,7 +262,7 @@ def get_annualized_capex(technology: str, build_year: int, discount_rate: float 
         discount_rate = config.DISCOUNT_RATE
 
     base_cost = config.BUILD_COSTS.get(technology, 0)
-    projection_factor = _interpolate_projection_factor(technology, build_year)
+    projection_factor = _interpolate_projection_factor(technology, build_year, projection_set)
     projected_cost = base_cost * projection_factor
 
     lifetime = config.TECHNICAL_PARAMS.get(technology, {}).get("lifetime", 25)
@@ -376,7 +399,7 @@ def build_demand_profile(
             f"demand values for the current demand tiling workflow; found {len(base_load)}."
         )
 
-    years = list(range(start_year, end_year + 1))
+    years = list(range(start_year, end_year))   # end_year is exclusive
     return build_demand_growth_profile(
         base_load_series=pd.Series(base_load),
         years=years,
@@ -482,11 +505,14 @@ def build_multiperiod_network(
         end_year = config.MODEL_END_YEAR
 
     scenario = config.SCENARIOS[scenario_name]
-    investment_periods = list(range(start_year, end_year + 1))
+    projection_set = scenario.get("cost_projection", "default")
+    # end_year is an exclusive right boundary: range(2025, 2046) covers 2025–2045.
+    investment_periods = list(range(start_year, end_year))
 
     print(f"\n{'='*70}")
     print(f"Building multi-period network: scenario='{scenario_name}'")
-    print(f"Horizon: {start_year}–{end_year} ({len(investment_periods)} investment periods)")
+    print(f"Horizon: {start_year}–{end_year - 1} ({len(investment_periods)} investment periods)")
+    print(f"Cost projection: {projection_set}")
     print(f"{'='*70}")
 
     # ------------------------------------------------------------------
@@ -494,7 +520,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     snapshots = create_multiindex_snapshots(
         start_year=start_year,
-        end_year=end_year,
+        end_year=end_year - 1,   # inclusive end for snapshot builder
         freq=config.FREQ,
         investment_periods=investment_periods,
     )
@@ -509,7 +535,7 @@ def build_multiperiod_network(
     # 3. Investment period weightings and snapshot weightings
     # ------------------------------------------------------------------
     inv_weightings = calculate_investment_period_weightings(
-        end_year=end_year + 1,
+        end_year=end_year,   # already exclusive — matches investment_periods boundary
         investment_period_years=investment_periods,
         discount_rate=config.DISCOUNT_RATE,
     )
@@ -587,7 +613,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     if "solar" in allowed:
         for build_yr in solar_build_years:
-            capex = get_annualized_capex("solar", build_yr)
+            capex = get_annualized_capex("solar", build_yr, projection_set=projection_set)
             add_solar_pv(
                 network=network,
                 name=f"Solar_Dili_{build_yr}",
@@ -605,7 +631,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     if "wind_onshore" in allowed:
         for build_yr in wind_build_years:
-            capex = get_annualized_capex("wind_onshore", build_yr)
+            capex = get_annualized_capex("wind_onshore", build_yr, projection_set=projection_set)
             add_wind_farm(
                 network=network,
                 name=f"Wind_Lospalos_{build_yr}",
@@ -623,9 +649,8 @@ def build_multiperiod_network(
     # 9. Add new battery storage (extendable)
     # ------------------------------------------------------------------
     if "battery" in allowed:
-        battery_capex_mw = get_annualized_capex("battery", start_year)
         for build_yr in battery_build_years:
-            battery_capex_mw = get_annualized_capex("battery", build_yr)
+            battery_capex_mw = get_annualized_capex("battery", build_yr, projection_set=projection_set)
             add_battery_storage(
                 network=network,
                 name=f"Battery_Dili_{build_yr}",
