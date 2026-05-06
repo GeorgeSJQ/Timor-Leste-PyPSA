@@ -13,6 +13,53 @@ from typing import Dict, List, Optional
 import config
 from timor_leste_config import build_timor_leste_network, add_loads_to_network
 from pypsa_setup import add_solar_pv, add_wind_farm, add_battery_storage
+
+
+# ============================================================================
+# New-build technology dispatch registry
+# ============================================================================
+# Drives the unified loop that adds extendable cohorts. Each entry tells the
+# builder what PyPSA component to create and which VRE trace (if any) to attach.
+#   component:  "Generator" or "StorageUnit"
+#   vre_kind:   "solar" / "wind" / None — selects which per-bus trace dict feeds
+#               the cohort's p_max_pu.
+#   carrier:    name in config.CARRIERS used by the new component.
+#
+# Adding a new technology only requires (1) adding an entry here, (2) populating
+# config.BUILD_COSTS / FIXED_OM_COSTS / MARGINAL_COSTS / TECHNICAL_PARAMS, and
+# (3) adding it to the relevant scenario's allowed_generators + NEW_BUILD_BUSES.
+
+TECH_DISPATCH_REGISTRY: Dict[str, Dict] = {
+    "solar":                {"component": "Generator",   "vre_kind": "solar", "carrier": "solar"},
+    "wind_onshore":         {"component": "Generator",   "vre_kind": "wind",  "carrier": "wind_onshore"},
+    "wind_offshore":        {"component": "Generator",   "vre_kind": "wind",  "carrier": "wind_offshore"},
+    "hydro":                {"component": "Generator",   "vre_kind": None,    "carrier": "hydro"},
+    "OCGT":                 {"component": "Generator",   "vre_kind": None,    "carrier": "OCGT"},
+    "CCGT":                 {"component": "Generator",   "vre_kind": None,    "carrier": "CCGT"},
+    "reciprocating_engine": {"component": "Generator",   "vre_kind": None,    "carrier": "reciprocating_engine"},
+    "coal":                 {"component": "Generator",   "vre_kind": None,    "carrier": "coal"},
+    "diesel":               {"component": "Generator",   "vre_kind": None,    "carrier": "diesel"},
+    "oil":                  {"component": "Generator",   "vre_kind": None,    "carrier": "oil"},
+    "battery":              {"component": "StorageUnit", "vre_kind": None,    "carrier": "battery"},
+    "pumped_hydro":         {"component": "StorageUnit", "vre_kind": None,    "carrier": "pumped_hydro"},
+}
+
+
+# Generator-attribute keys passed straight through from TECHNICAL_PARAMS to
+# network.add when present. PyPSA silently ignores unknown attributes, but we
+# whitelist to keep the call clean and skip our own custom keys
+# (forced_outage_rate, heat_rate_*, etc.).
+_GENERATOR_TECH_PARAM_KEYS = (
+    "efficiency", "p_min_pu",
+    "ramp_limit_up", "ramp_limit_down",
+    "min_up_time", "min_down_time",
+    "start_up_cost", "shut_down_cost",
+)
+_STORAGE_TECH_PARAM_KEYS = (
+    "max_hours", "standing_loss",
+    "efficiency_store", "efficiency_dispatch",
+    "p_min_pu",
+)
 from src.scenarios import (
     build_demand_growth_profile,
     apply_scenario_config,
@@ -594,16 +641,35 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     # 5. Build VRE capacity-factor traces (Renewables Ninja CSV or atlite)
     # ------------------------------------------------------------------
+    # Resolve per-scenario overrides for bus placement and trace sources
+    new_build_buses = scenario.get(
+        "new_build_buses",
+        getattr(config, "NEW_BUILD_BUSES", {}),
+    )
+    max_bus_capacity = scenario.get(
+        "max_bus_capacity",
+        getattr(config, "MAX_BUS_CAPACITY", {}),
+    )
+    rn_csv_paths = scenario.get(
+        "renewables_ninja_csv_paths",
+        getattr(config, "RENEWABLES_NINJA_CSV_PATHS", {}),
+    )
+
+    solar_buses = list(new_build_buses.get("solar", []))
+    wind_buses = list(new_build_buses.get("wind_onshore", []))
+    battery_buses = list(new_build_buses.get("battery", []))
+
     vre_source = getattr(config, "VRE_TRACE_SOURCE", "renewables_ninja")
     print(f"\nVRE trace source: {vre_source}")
+    print(f"New-build buses: solar={solar_buses}, wind_onshore={wind_buses}, battery={battery_buses}")
 
-    solar_per_bus: Optional[Dict[str, pd.Series]] = None
-    wind_per_bus: Optional[Dict[str, pd.Series]] = None
+    solar_traces_by_bus: Dict[str, pd.Series] = {}
+    wind_traces_by_bus: Dict[str, pd.Series] = {}
 
     if vre_source == "atlite":
         from src.atlite_traces import build_atlite_vre_traces, export_atlite_traces
 
-        solar_per_bus, wind_per_bus, _, _ = build_atlite_vre_traces(
+        atlite_solar, atlite_wind, _, _ = build_atlite_vre_traces(
             snapshots=snapshots,
             model_start_year=start_year,
             model_end_year_exclusive=end_year,
@@ -613,36 +679,74 @@ def build_multiperiod_network(
 
         if output_dir is not None:
             export_atlite_traces(
-                solar_per_bus=solar_per_bus,
-                wind_per_bus=wind_per_bus,
+                solar_per_bus=atlite_solar,
+                wind_per_bus=atlite_wind,
                 output_dir=output_dir,
                 scenario_name=scenario_name,
             )
 
-        # The legacy code paths (steps 7 & 8) attach a single trace at Dili
-        # (solar) and Lospalos (wind). Pass the bus-specific atlite trace so
-        # the model still produces meaningful results without changing the
-        # generator topology yet.
-        solar_cf = solar_per_bus.get("Dili")
-        wind_cf = wind_per_bus.get("Lospalos")
-        if solar_cf is None or wind_cf is None:
-            raise RuntimeError(
-                "atlite traces missing expected buses ('Dili' for solar, "
-                "'Lospalos' for wind). Check bus_coords_for_atlite()."
-            )
+        # Per-bus atlite traces — every model bus has its own series.
+        for bus in solar_buses:
+            if bus not in atlite_solar:
+                raise RuntimeError(
+                    f"atlite did not produce a solar trace for bus '{bus}'. "
+                    f"Check that '{bus}' is in timor_leste_config.SUBSTATIONS "
+                    f"or POWER_PLANTS so bus_coords_for_atlite() includes it."
+                )
+            solar_traces_by_bus[bus] = atlite_solar[bus]
+        for bus in wind_buses:
+            if bus not in atlite_wind:
+                raise RuntimeError(
+                    f"atlite did not produce a wind trace for bus '{bus}'. "
+                    f"Check that '{bus}' is in timor_leste_config.SUBSTATIONS "
+                    f"or POWER_PLANTS so bus_coords_for_atlite() includes it."
+                )
+            wind_traces_by_bus[bus] = atlite_wind[bus]
+
     else:
-        solar_cf = prepare_vre_trace_for_snapshots(
-            csv_path=solar_csv,
-            snapshots=snapshots,
-            freq=config.FREQ,
-            target_timezone="Asia/Dili",
-        )
-        wind_cf = prepare_vre_trace_for_snapshots(
-            csv_path=wind_csv,
-            snapshots=snapshots,
-            freq=config.FREQ,
-            target_timezone="Asia/Dili",
-        )
+        # Renewables Ninja: per-bus CSV paths if provided, else lazy fallback
+        # to the default CSV. The default CSV is only loaded if at least one
+        # bus needs it.
+        solar_csv_paths = rn_csv_paths.get("solar", {}) if rn_csv_paths else {}
+        wind_csv_paths = rn_csv_paths.get("wind_onshore", {}) if rn_csv_paths else {}
+
+        default_solar_cf = None
+        default_wind_cf = None
+
+        for bus in solar_buses:
+            if bus in solar_csv_paths:
+                solar_traces_by_bus[bus] = prepare_vre_trace_for_snapshots(
+                    csv_path=solar_csv_paths[bus],
+                    snapshots=snapshots,
+                    freq=config.FREQ,
+                    target_timezone="Asia/Dili",
+                )
+            else:
+                if default_solar_cf is None:
+                    default_solar_cf = prepare_vre_trace_for_snapshots(
+                        csv_path=solar_csv,
+                        snapshots=snapshots,
+                        freq=config.FREQ,
+                        target_timezone="Asia/Dili",
+                    )
+                solar_traces_by_bus[bus] = default_solar_cf
+        for bus in wind_buses:
+            if bus in wind_csv_paths:
+                wind_traces_by_bus[bus] = prepare_vre_trace_for_snapshots(
+                    csv_path=wind_csv_paths[bus],
+                    snapshots=snapshots,
+                    freq=config.FREQ,
+                    target_timezone="Asia/Dili",
+                )
+            else:
+                if default_wind_cf is None:
+                    default_wind_cf = prepare_vre_trace_for_snapshots(
+                        csv_path=wind_csv,
+                        snapshots=snapshots,
+                        freq=config.FREQ,
+                        target_timezone="Asia/Dili",
+                    )
+                wind_traces_by_bus[bus] = default_wind_cf
 
     # ------------------------------------------------------------------
     # 6. Determine build years for new expandable generators
@@ -660,76 +764,118 @@ def build_multiperiod_network(
                 last = yr
         return filtered
 
-    solar_lifetime = config.TECHNICAL_PARAMS["solar"]["lifetime"]
-    wind_lifetime = config.TECHNICAL_PARAMS["wind_onshore"]["lifetime"]
-    battery_lifetime = config.TECHNICAL_PARAMS["battery"]["lifetime"]
-
-    solar_build_years = _filter_build_years(investment_periods, solar_lifetime)
-    wind_build_years = _filter_build_years(investment_periods, wind_lifetime)
-    battery_build_years = _filter_build_years(investment_periods, battery_lifetime)
-
+    build_start_years = getattr(config, "TECHNOLOGY_BUILD_START_YEARS", {})
     allowed = scenario.get("allowed_generators", ["solar", "wind_onshore", "battery", "diesel"])
 
     # ------------------------------------------------------------------
-    # 7. Add new solar PV generators (extendable, one per valid build year)
+    # 7. Add new-build cohorts for every (tech, bus, build year) in scope
     # ------------------------------------------------------------------
-    if "solar" in allowed:
-        for build_yr in solar_build_years:
-            capex = get_annualized_capex("solar", build_yr, projection_set=projection_set)
-            add_solar_pv(
-                network=network,
-                name=f"Solar_Dili_{build_yr}",
-                bus="Dili",
-                capital_cost=capex,
-                marginal_cost=config.MARGINAL_COSTS["solar"],
-                p_max_pu=solar_cf,
-                lifetime=solar_lifetime,
-                build_year=build_yr,
-                p_nom_extendable=True,
-            )
+    # Driven by NEW_BUILD_BUSES + TECH_DISPATCH_REGISTRY. One cohort per triple,
+    # named "<TechLabel>_<bus>_<year>". Per-bus capacity caps from
+    # max_bus_capacity[tech][bus] are applied as p_nom_max on the cohort.
+    for tech, buses in new_build_buses.items():
+        if not buses:
+            continue
+        if tech not in TECH_DISPATCH_REGISTRY:
+            print(f"  WARNING: tech '{tech}' is not in TECH_DISPATCH_REGISTRY; skipping.")
+            continue
+        if tech not in allowed:
+            continue
+
+        spec = TECH_DISPATCH_REGISTRY[tech]
+        component = spec["component"]
+        carrier = spec["carrier"]
+        vre_kind = spec["vre_kind"]
+
+        tech_params = config.TECHNICAL_PARAMS.get(tech, {})
+        tech_lifetime = tech_params.get("lifetime", 25)
+        tech_marginal_cost = config.MARGINAL_COSTS.get(tech, 0.0)
+        tech_caps = max_bus_capacity.get(tech, {}) if max_bus_capacity else {}
+
+        # Allowed build years: investment periods >= TECHNOLOGY_BUILD_START_YEARS[tech],
+        # filtered so consecutive cohorts don't overlap with their own lifetime.
+        tech_build_years = _filter_build_years(
+            [yr for yr in investment_periods if yr >= build_start_years.get(tech, start_year)],
+            tech_lifetime,
+        )
+        if not tech_build_years:
+            continue
+
+        # Pre-build the per-tech kwargs that are constant across (bus, year)
+        if component == "Generator":
+            tech_kwargs = {k: tech_params[k] for k in _GENERATOR_TECH_PARAM_KEYS if k in tech_params}
+        else:  # StorageUnit
+            tech_kwargs = {k: tech_params[k] for k in _STORAGE_TECH_PARAM_KEYS if k in tech_params}
+            # Battery wrapper exposes efficiency_charge/discharge; the StorageUnit
+            # component itself uses efficiency_store/efficiency_dispatch.
+            if "efficiency_charge" in tech_params:
+                tech_kwargs["efficiency_store"] = tech_params["efficiency_charge"]
+            if "efficiency_discharge" in tech_params:
+                tech_kwargs["efficiency_dispatch"] = tech_params["efficiency_discharge"]
+
+        for bus in buses:
+            if bus not in network.buses.index:
+                print(f"  WARNING: skipping {tech} at unknown bus '{bus}'.")
+                continue
+
+            # Resolve the p_max_pu trace for VRE technologies.
+            p_max_pu_value = 1.0
+            if vre_kind == "solar":
+                if bus not in solar_traces_by_bus:
+                    print(f"  WARNING: no solar trace for bus '{bus}'; skipping {tech} cohorts there.")
+                    continue
+                p_max_pu_value = solar_traces_by_bus[bus]
+            elif vre_kind == "wind":
+                if bus not in wind_traces_by_bus:
+                    print(f"  WARNING: no wind trace for bus '{bus}'; skipping {tech} cohorts there.")
+                    continue
+                p_max_pu_value = wind_traces_by_bus[bus]
+
+            # Per-bus capacity cap (applied per cohort).
+            cap_kwargs = {}
+            if bus in tech_caps and tech_caps[bus] is not None:
+                cap_kwargs["p_nom_max"] = float(tech_caps[bus])
+
+            for build_yr in tech_build_years:
+                capex = get_annualized_capex(tech, build_yr, projection_set=projection_set)
+                cohort_name = f"{tech}_{bus}_{build_yr}"
+
+                if component == "Generator":
+                    network.add(
+                        "Generator",
+                        cohort_name,
+                        bus=bus,
+                        carrier=carrier,
+                        capital_cost=capex,
+                        marginal_cost=tech_marginal_cost,
+                        p_max_pu=p_max_pu_value,
+                        lifetime=tech_lifetime,
+                        build_year=build_yr,
+                        p_nom_extendable=True,
+                        **tech_kwargs,
+                        **cap_kwargs,
+                    )
+                else:  # StorageUnit
+                    network.add(
+                        "StorageUnit",
+                        cohort_name,
+                        bus=bus,
+                        carrier=carrier,
+                        capital_cost=capex,
+                        marginal_cost=tech_marginal_cost,
+                        cyclic_state_of_charge=True,
+                        lifetime=tech_lifetime,
+                        build_year=build_yr,
+                        p_nom_extendable=True,
+                        **tech_kwargs,
+                        **cap_kwargs,
+                    )
+                    # PyPSA expects the inflow series for storage to exist (multi-period
+                    # optimizer reads it); initialise to zero unless something later sets it.
+                    network.storage_units_t.inflow[cohort_name] = pd.Series(0.0, index=network.snapshots)
 
     # ------------------------------------------------------------------
-    # 8. Add new wind farm generators (extendable)
-    # ------------------------------------------------------------------
-    if "wind_onshore" in allowed:
-        for build_yr in wind_build_years:
-            capex = get_annualized_capex("wind_onshore", build_yr, projection_set=projection_set)
-            add_wind_farm(
-                network=network,
-                name=f"Wind_Lospalos_{build_yr}",
-                bus="Lospalos",
-                capital_cost=capex,
-                marginal_cost=config.MARGINAL_COSTS["wind_onshore"],
-                p_max_pu=wind_cf,
-                wind_type="onshore",
-                lifetime=wind_lifetime,
-                build_year=build_yr,
-                p_nom_extendable=True,
-            )
-
-    # ------------------------------------------------------------------
-    # 9. Add new battery storage (extendable)
-    # ------------------------------------------------------------------
-    if "battery" in allowed:
-        for build_yr in battery_build_years:
-            battery_capex_mw = get_annualized_capex("battery", build_yr, projection_set=projection_set)
-            add_battery_storage(
-                network=network,
-                name=f"Battery_Dili_{build_yr}",
-                bus="Dili",
-                capital_cost=battery_capex_mw,
-                marginal_cost=config.MARGINAL_COSTS["battery"],
-                efficiency_charge=config.TECHNICAL_PARAMS["battery"]["efficiency_charge"],
-                efficiency_discharge=config.TECHNICAL_PARAMS["battery"]["efficiency_discharge"],
-                max_hours=config.TECHNICAL_PARAMS["battery"]["max_hours"],
-                standing_loss=config.TECHNICAL_PARAMS["battery"]["standing_loss"],
-                lifetime=battery_lifetime,
-                build_year=build_yr,
-                p_nom_extendable=True,
-            )
-
-    # ------------------------------------------------------------------
-    # 10. Apply fuel price trajectories (carrier → list of date-range modifiers).
+    # 8. Apply fuel price trajectories (carrier → list of date-range modifiers).
     # ------------------------------------------------------------------
     # Done after all generators (existing + new) are added so any new
     # carrier-matching generator picks up the trajectory.
@@ -742,12 +888,12 @@ def build_multiperiod_network(
     )
 
     # ------------------------------------------------------------------
-    # 11. Apply scenario config (filter carriers)
+    # 9. Apply scenario config (filter carriers)
     # ------------------------------------------------------------------
     apply_scenario_config(network, scenario)
 
     # ------------------------------------------------------------------
-    # 12. Build multi-year load profiles and attach to buses
+    # 10. Build multi-year load profiles and attach to buses
     # ------------------------------------------------------------------
     # Load distribution matches timor_leste_config.add_loads_to_network
     load_distribution = {
