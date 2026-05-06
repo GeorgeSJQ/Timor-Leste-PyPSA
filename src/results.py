@@ -267,9 +267,28 @@ def export_statistics(n: pypsa.Network, output_dir: str, scenario_name: str = "b
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Raw statistics
+    # Raw statistics — exported in long format
     try:
-        n.statistics().to_csv(os.path.join(output_dir, "statistics.csv"))
+        stats = n.statistics()
+        stats.index.names = ["Network_Component", "Component_Name"]
+
+        if isinstance(stats.columns, pd.MultiIndex):
+            # Multi-period: columns are (Category, investment_period)
+            stats.columns.names = ["Category", "Investment_Period"]
+            long = (
+                stats
+                .stack(level=["Category", "Investment_Period"], future_stack=True)
+                .reset_index()
+            )
+            long.columns = ["Network_Component", "Component_Name", "Category", "Investment_Period", "Value"]
+        else:
+            # Single-period: columns are flat metric names
+            stats.columns.name = "Category"
+            long = stats.stack(future_stack=True).reset_index()
+            long.columns = ["Network_Component", "Component_Name", "Category", "Value"]
+            long.insert(3, "Investment_Period", pd.NA)
+
+        long.to_csv(os.path.join(output_dir, "statistics.csv"), index=False)
     except Exception as e:
         print(f"Warning: could not export statistics.csv: {e}")
 

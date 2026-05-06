@@ -8,12 +8,19 @@ import os
 import numpy as np
 import pandas as pd
 import pypsa
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import config
 from timor_leste_config import build_timor_leste_network, add_loads_to_network
 from pypsa_setup import add_solar_pv, add_wind_farm, add_battery_storage
-from src.scenarios import build_demand_growth_profile, apply_scenario_config
+from src.scenarios import (
+    build_demand_growth_profile,
+    apply_scenario_config,
+    build_fuel_price_trajectory,
+    build_random_load_profiles,
+    export_fuel_price_series,
+    export_load_profiles,
+)
 
 
 # ============================================================================
@@ -190,12 +197,26 @@ def get_annualized_cost(cost: float, lifetime: int, discount_rate: float) -> flo
     return cost * r / (1.0 - 1.0 / (1.0 + r) ** lifetime)
 
 
-def _interpolate_projection_factor(technology: str, year: int) -> float:
+def _interpolate_projection_factor(
+    technology: str,
+    year: int,
+    projection_set: str = "default",
+) -> float:
     """
-    Return the cost projection factor for a technology at a given year,
-    linearly interpolating between the milestone years in COST_PROJECTION_FACTORS.
+    Return the cost projection factor for a technology at a given year.
+
+    Linearly interpolates between milestone years in the named projection set
+    from config.COST_PROJECTION_SETS. Returns 1.0 if the technology or set
+    is not found.
     """
-    factors = config.COST_PROJECTION_FACTORS.get(technology)
+    sets = config.COST_PROJECTION_SETS
+    if projection_set not in sets:
+        raise ValueError(
+            f"Unknown cost_projection '{projection_set}'. "
+            f"Available sets: {sorted(sets.keys())}"
+        )
+
+    factors = sets[projection_set].get(technology)
     if factors is None:
         return 1.0
 
@@ -215,12 +236,18 @@ def _interpolate_projection_factor(technology: str, year: int) -> float:
     return 1.0
 
 
-def get_annualized_capex(technology: str, build_year: int, discount_rate: float = None) -> float:
+def get_annualized_capex(
+    technology: str,
+    build_year: int,
+    discount_rate: float = None,
+    projection_set: str = "default",
+) -> float:
     """
     Return the annualised capital cost for a technology in a given build year.
 
-    Applies the year-specific projection factor from COST_PROJECTION_FACTORS to
-    the 2025 base BUILD_COSTS, then annualises and adds FOM.
+    Applies the year-specific projection factor from the named cost projection
+    set in config.COST_PROJECTION_SETS to the 2025 base BUILD_COSTS, then
+    annualises with the annuity formula and adds FOM.
 
     Parameters
     ----------
@@ -230,6 +257,9 @@ def get_annualized_capex(technology: str, build_year: int, discount_rate: float 
         Year of investment.
     discount_rate : float, optional
         Defaults to config.DISCOUNT_RATE.
+    projection_set : str, optional
+        Name of the cost projection set (key in config.COST_PROJECTION_SETS).
+        Defaults to "default".
 
     Returns
     -------
@@ -239,7 +269,7 @@ def get_annualized_capex(technology: str, build_year: int, discount_rate: float 
         discount_rate = config.DISCOUNT_RATE
 
     base_cost = config.BUILD_COSTS.get(technology, 0)
-    projection_factor = _interpolate_projection_factor(technology, build_year)
+    projection_factor = _interpolate_projection_factor(technology, build_year, projection_set)
     projected_cost = base_cost * projection_factor
 
     lifetime = config.TECHNICAL_PARAMS.get(technology, {}).get("lifetime", 25)
@@ -376,7 +406,7 @@ def build_demand_profile(
             f"demand values for the current demand tiling workflow; found {len(base_load)}."
         )
 
-    years = list(range(start_year, end_year + 1))
+    years = list(range(start_year, end_year))   # end_year is exclusive
     return build_demand_growth_profile(
         base_load_series=pd.Series(base_load),
         years=years,
@@ -385,54 +415,79 @@ def build_demand_profile(
     )
 
 
-def build_marginal_cost_series(
-    technology: str,
+def apply_fuel_price_trajectories(
+    network: pypsa.Network,
     snapshots: pd.Index,
-    base_marginal_cost: float,
-    diesel_price_factor: float = 1.0,
-    diesel_price_ramp_year: Optional[int] = None,
-) -> pd.Series:
+    fuel_price_trajectories: Optional[Dict[str, List[Dict]]],
+    output_dir: Optional[str] = None,
+    scenario_name: str = "",
+) -> Dict[str, pd.Series]:
     """
-    Build a time-indexed marginal cost series for a generator.
+    Build and attach fuel price (marginal cost) time series to all generators
+    of each carrier listed in ``fuel_price_trajectories``.
 
-    For diesel, applies a linear price ramp from 1.0 × base_mc in the start
-    year to diesel_price_factor × base_mc in diesel_price_ramp_year, then holds flat.
+    For each carrier key, the base price is taken from ``config.MARGINAL_COSTS``
+    and the modifier list is passed to ``build_fuel_price_trajectory``. The
+    resulting series is assigned to ``network.generators_t.marginal_cost[gen]``
+    for every generator with that carrier.
+
+    If ``output_dir`` is provided, the generated series are exported as a CSV
+    plus a matplotlib PNG to ``{output_dir}/inputs/`` for the run record.
+
+    Carriers absent from ``fuel_price_trajectories`` keep the static
+    ``marginal_cost`` value already set on the generator.
 
     Parameters
     ----------
-    technology : str
+    network : pypsa.Network
+        Assembled network (generators already added).
     snapshots : pd.Index
-        Network snapshots (single or MultiIndex).
-    base_marginal_cost : float
-    diesel_price_factor : float
-        Final diesel price multiplier.
-    diesel_price_ramp_year : int, optional
-        Year by which the full price factor is reached (linear ramp from start year).
+        Network snapshots, used as the index for each price series.
+    fuel_price_trajectories : dict[str, list[dict]] or None
+        Mapping of carrier name → list of modifier dicts. If None or empty,
+        no time-varying marginal costs are attached.
+    output_dir : str, optional
+        Scenario output directory. If given, custom series are exported to
+        ``{output_dir}/inputs/fuel_price_trajectories.{csv,png}``.
+    scenario_name : str, optional
+        Used only as the title of the exported plot.
 
     Returns
     -------
-    pd.Series indexed by snapshots.
+    dict[str, pd.Series]
+        Carrier → built series. Empty if no trajectories were applied.
     """
-    if isinstance(snapshots, pd.MultiIndex):
-        years = snapshots.get_level_values("timestep").year
-    else:
-        years = snapshots.year
+    built: Dict[str, pd.Series] = {}
 
-    mc_values = np.full(len(snapshots), base_marginal_cost, dtype=float)
+    if not fuel_price_trajectories:
+        return built
 
-    if technology == "diesel" and diesel_price_factor != 1.0 and diesel_price_ramp_year is not None:
-        start_year = int(years.min())
-        for i, year in enumerate(years):
-            if year <= start_year:
-                factor = 1.0
-            elif year >= diesel_price_ramp_year:
-                factor = diesel_price_factor
-            else:
-                t = (year - start_year) / (diesel_price_ramp_year - start_year)
-                factor = 1.0 + t * (diesel_price_factor - 1.0)
-            mc_values[i] = base_marginal_cost * factor
+    for carrier, modifiers in fuel_price_trajectories.items():
+        if carrier not in config.MARGINAL_COSTS:
+            print(f"  WARNING: carrier '{carrier}' not in MARGINAL_COSTS; skipping fuel trajectory.")
+            continue
 
-    return pd.Series(mc_values, index=snapshots)
+        base_price = config.MARGINAL_COSTS[carrier]
+        series = build_fuel_price_trajectory(
+            snapshots=snapshots,
+            base_price=base_price,
+            modifiers=modifiers,
+        )
+
+        gens = network.generators.index[network.generators.carrier == carrier]
+        for gen in gens:
+            network.generators_t.marginal_cost[gen] = series
+
+        built[carrier] = series
+
+    if built and output_dir is not None:
+        export_fuel_price_series(
+            series_by_carrier=built,
+            output_dir=output_dir,
+            scenario_name=scenario_name,
+        )
+
+    return built
 
 
 # ============================================================================
@@ -446,6 +501,7 @@ def build_multiperiod_network(
     solar_csv: str = r"data\solar_pv_output_re_ninja.csv",
     wind_csv: str = r"data\wind_output_re_ninja.csv",
     demand_csv: str = r"data\timor_leste_hourly_load_2025.csv",
+    output_dir: Optional[str] = None,
 ) -> pypsa.Network:
     """
     Assemble a multi-period investment planning network for Timor-Leste.
@@ -471,6 +527,10 @@ def build_multiperiod_network(
         Override config.MODEL_START_YEAR / MODEL_END_YEAR.
     solar_csv, wind_csv, demand_csv : str
         Paths to Renewables Ninja and demand CSV files.
+    output_dir : str, optional
+        Scenario output directory. If given, custom fuel price trajectories
+        are exported as CSV + PNG to ``{output_dir}/inputs/`` for the run
+        record. Pass None (default) to skip the export.
 
     Returns
     -------
@@ -482,11 +542,14 @@ def build_multiperiod_network(
         end_year = config.MODEL_END_YEAR
 
     scenario = config.SCENARIOS[scenario_name]
-    investment_periods = list(range(start_year, end_year + 1))
+    projection_set = scenario.get("cost_projection", "default")
+    # end_year is an exclusive right boundary: range(2025, 2046) covers 2025–2045.
+    investment_periods = list(range(start_year, end_year))
 
     print(f"\n{'='*70}")
     print(f"Building multi-period network: scenario='{scenario_name}'")
-    print(f"Horizon: {start_year}–{end_year} ({len(investment_periods)} investment periods)")
+    print(f"Horizon: {start_year}–{end_year - 1} ({len(investment_periods)} investment periods)")
+    print(f"Cost projection: {projection_set}")
     print(f"{'='*70}")
 
     # ------------------------------------------------------------------
@@ -494,7 +557,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     snapshots = create_multiindex_snapshots(
         start_year=start_year,
-        end_year=end_year,
+        end_year=end_year - 1,   # inclusive end for snapshot builder
         freq=config.FREQ,
         investment_periods=investment_periods,
     )
@@ -509,7 +572,7 @@ def build_multiperiod_network(
     # 3. Investment period weightings and snapshot weightings
     # ------------------------------------------------------------------
     inv_weightings = calculate_investment_period_weightings(
-        end_year=end_year + 1,
+        end_year=end_year,   # already exclusive — matches investment_periods boundary
         investment_period_years=investment_periods,
         discount_rate=config.DISCOUNT_RATE,
     )
@@ -528,33 +591,58 @@ def build_multiperiod_network(
             lifetime = config.TECHNICAL_PARAMS.get(technology, {}).get("lifetime", 20)
             network.generators.at[gen, "lifetime"] = lifetime
 
-    # Build diesel marginal cost time series for existing plants
-    diesel_mc_series = build_marginal_cost_series(
-        technology="diesel",
-        snapshots=snapshots,
-        base_marginal_cost=config.MARGINAL_COSTS["diesel"],
-        diesel_price_factor=scenario.get("diesel_price_factor", 1.0),
-        diesel_price_ramp_year=scenario.get("diesel_price_ramp_year"),
-    )
-    for gen in network.generators.index:
-        if network.generators.at[gen, "carrier"] == "diesel":
-            network.generators_t.marginal_cost[gen] = diesel_mc_series
+    # ------------------------------------------------------------------
+    # 5. Build VRE capacity-factor traces (Renewables Ninja CSV or atlite)
+    # ------------------------------------------------------------------
+    vre_source = getattr(config, "VRE_TRACE_SOURCE", "renewables_ninja")
+    print(f"\nVRE trace source: {vre_source}")
 
-    # ------------------------------------------------------------------
-    # 5. Load Renewables Ninja CSV files
-    # ------------------------------------------------------------------
-    solar_cf = prepare_vre_trace_for_snapshots(
-        csv_path=solar_csv,
-        snapshots=snapshots,
-        freq=config.FREQ,
-        target_timezone="Asia/Dili",
-    )
-    wind_cf = prepare_vre_trace_for_snapshots(
-        csv_path=wind_csv,
-        snapshots=snapshots,
-        freq=config.FREQ,
-        target_timezone="Asia/Dili",
-    )
+    solar_per_bus: Optional[Dict[str, pd.Series]] = None
+    wind_per_bus: Optional[Dict[str, pd.Series]] = None
+
+    if vre_source == "atlite":
+        from src.atlite_traces import build_atlite_vre_traces, export_atlite_traces
+
+        solar_per_bus, wind_per_bus, _, _ = build_atlite_vre_traces(
+            snapshots=snapshots,
+            model_start_year=start_year,
+            model_end_year_exclusive=end_year,
+            config_dict=config.ATLITE_CONFIG,
+            target_timezone="Asia/Dili",
+        )
+
+        if output_dir is not None:
+            export_atlite_traces(
+                solar_per_bus=solar_per_bus,
+                wind_per_bus=wind_per_bus,
+                output_dir=output_dir,
+                scenario_name=scenario_name,
+            )
+
+        # The legacy code paths (steps 7 & 8) attach a single trace at Dili
+        # (solar) and Lospalos (wind). Pass the bus-specific atlite trace so
+        # the model still produces meaningful results without changing the
+        # generator topology yet.
+        solar_cf = solar_per_bus.get("Dili")
+        wind_cf = wind_per_bus.get("Lospalos")
+        if solar_cf is None or wind_cf is None:
+            raise RuntimeError(
+                "atlite traces missing expected buses ('Dili' for solar, "
+                "'Lospalos' for wind). Check bus_coords_for_atlite()."
+            )
+    else:
+        solar_cf = prepare_vre_trace_for_snapshots(
+            csv_path=solar_csv,
+            snapshots=snapshots,
+            freq=config.FREQ,
+            target_timezone="Asia/Dili",
+        )
+        wind_cf = prepare_vre_trace_for_snapshots(
+            csv_path=wind_csv,
+            snapshots=snapshots,
+            freq=config.FREQ,
+            target_timezone="Asia/Dili",
+        )
 
     # ------------------------------------------------------------------
     # 6. Determine build years for new expandable generators
@@ -587,7 +675,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     if "solar" in allowed:
         for build_yr in solar_build_years:
-            capex = get_annualized_capex("solar", build_yr)
+            capex = get_annualized_capex("solar", build_yr, projection_set=projection_set)
             add_solar_pv(
                 network=network,
                 name=f"Solar_Dili_{build_yr}",
@@ -605,7 +693,7 @@ def build_multiperiod_network(
     # ------------------------------------------------------------------
     if "wind_onshore" in allowed:
         for build_yr in wind_build_years:
-            capex = get_annualized_capex("wind_onshore", build_yr)
+            capex = get_annualized_capex("wind_onshore", build_yr, projection_set=projection_set)
             add_wind_farm(
                 network=network,
                 name=f"Wind_Lospalos_{build_yr}",
@@ -623,9 +711,8 @@ def build_multiperiod_network(
     # 9. Add new battery storage (extendable)
     # ------------------------------------------------------------------
     if "battery" in allowed:
-        battery_capex_mw = get_annualized_capex("battery", start_year)
         for build_yr in battery_build_years:
-            battery_capex_mw = get_annualized_capex("battery", build_yr)
+            battery_capex_mw = get_annualized_capex("battery", build_yr, projection_set=projection_set)
             add_battery_storage(
                 network=network,
                 name=f"Battery_Dili_{build_yr}",
@@ -642,21 +729,26 @@ def build_multiperiod_network(
             )
 
     # ------------------------------------------------------------------
-    # 10. Apply scenario config (filter carriers, price overrides)
+    # 10. Apply fuel price trajectories (carrier → list of date-range modifiers).
+    # ------------------------------------------------------------------
+    # Done after all generators (existing + new) are added so any new
+    # carrier-matching generator picks up the trajectory.
+    apply_fuel_price_trajectories(
+        network=network,
+        snapshots=snapshots,
+        fuel_price_trajectories=scenario.get("fuel_price_trajectories"),
+        output_dir=output_dir,
+        scenario_name=scenario_name,
+    )
+
+    # ------------------------------------------------------------------
+    # 11. Apply scenario config (filter carriers)
     # ------------------------------------------------------------------
     apply_scenario_config(network, scenario)
 
     # ------------------------------------------------------------------
-    # 11. Build multi-year load profiles and attach to buses
+    # 12. Build multi-year load profiles and attach to buses
     # ------------------------------------------------------------------
-    demand_profile = build_demand_profile(
-        base_csv_path=demand_csv,
-        start_year=start_year,
-        end_year=end_year,
-        growth_rate=scenario.get("demand_growth_rate", 0.03),
-        freq=config.FREQ,
-    )
-
     # Load distribution matches timor_leste_config.add_loads_to_network
     load_distribution = {
         "Dili": 0.29, "Baucau": 0.108, "Maliana": 0.086, "Liquica": 0.172,
@@ -664,22 +756,55 @@ def build_multiperiod_network(
         "Cassa": 0.061, "Suai": 0.062, "Betano": 0.052,
     }
 
-    # Re-index demand profile to network's MultiIndex snapshots
-    if len(demand_profile) != len(snapshots):
-        raise ValueError(
-            f"Demand profile length ({len(demand_profile)}) does not match "
-            f"network snapshots ({len(snapshots)}). Check FREQ and demand CSV resolution."
-        )
-    demand_indexed = pd.Series(demand_profile.values, index=snapshots)
+    load_mode = getattr(config, "LOAD_MODE", "csv")
+    print(f"\nLoad mode: {load_mode}")
 
-    for bus, share in load_distribution.items():
-        if bus in network.buses.index:
-            network.add(
-                "Load",
-                f"Load_{bus}",
-                bus=bus,
-                p_set=demand_indexed * share,
+    if load_mode == "random":
+        # Synthesised typical-shape profiles per bus (no demand growth applied).
+        profiles = build_random_load_profiles(
+            snapshots=snapshots,
+            load_distribution=load_distribution,
+            config_dict=config.LOAD_RANDOM_CONFIG,
+        )
+        if output_dir is not None:
+            export_load_profiles(profiles, output_dir, scenario_name=scenario_name)
+
+        for bus, p_set in profiles.items():
+            if bus in network.buses.index:
+                network.add(
+                    "Load",
+                    f"Load_{bus}",
+                    bus=bus,
+                    p_set=p_set,
+                )
+
+    else:
+        # CSV path with compound demand growth (existing behaviour).
+        demand_profile = build_demand_profile(
+            base_csv_path=demand_csv,
+            start_year=start_year,
+            end_year=end_year,
+            growth_rate=scenario.get("demand_growth_rate", 0.03),
+            freq=config.FREQ,
+        )
+
+        # Re-index demand profile to network's MultiIndex snapshots
+        if len(demand_profile) != len(snapshots):
+            raise ValueError(
+                f"Demand profile length ({len(demand_profile)}) does not match "
+                f"network snapshots ({len(snapshots)}). Check FREQ and demand CSV resolution."
             )
+        demand_indexed = pd.Series(demand_profile.values, index=snapshots)
+
+        csv_profiles: Dict[str, pd.Series] = {}
+        for bus, share in load_distribution.items():
+            if bus in network.buses.index:
+                bus_series = (demand_indexed * share).rename(f"Load_{bus}")
+                network.add("Load", f"Load_{bus}", bus=bus, p_set=bus_series)
+                csv_profiles[bus] = bus_series
+
+        if output_dir is not None:
+            export_load_profiles(csv_profiles, output_dir, scenario_name=scenario_name)
 
     print(f"\nNetwork assembly complete.")
     print(f"  Generators:     {len(network.generators)}")

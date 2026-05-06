@@ -278,24 +278,39 @@ def build_timor_leste_network(
 # HELPER FUNCTIONS
 # ============================================================================
 
-def add_loads_to_network(network, load_csv_path=r"data\timor_leste_hourly_load_2025.csv"):
+def add_loads_to_network(
+    network,
+    load_csv_path=r"data\timor_leste_hourly_load_2025.csv",
+    output_dir=None,
+    scenario_name="single_year",
+):
     """
     Add electrical loads to each substation based on population distribution.
-    
-    Parameters:
-    -----------
+
+    Honours ``config.LOAD_MODE``:
+      - ``"csv"`` (default): tile the hourly load CSV across snapshots and
+        scale each bus by its population share.
+      - ``"random"``: synthesise typical-shape per-bus profiles from
+        ``config.LOAD_RANDOM_CONFIG``. If ``output_dir`` is provided, the
+        profiles are also exported to ``{output_dir}/inputs/``.
+
+    Parameters
+    ----------
     network : pypsa.Network
-        The PyPSA network object
+        The PyPSA network object.
     load_csv_path : str, optional
-        Path to the CSV file containing the hourly load profile
-        Default: "data\\timor_leste_hourly_load_2025.csv"
-    
-    Returns:
-    --------
-    None
+        Path to the CSV file containing the hourly load profile (CSV mode).
+    output_dir : str, optional
+        Scenario output directory. If given AND mode is "random", random
+        profiles are exported to ``{output_dir}/inputs/``.
+    scenario_name : str, optional
+        Used only as the title of the exported plot.
     """
+    import config
+    from src.scenarios import build_random_load_profiles, export_load_profiles
+
     print("\nAdding load profiles...")
-    
+
     # Load distribution based on population
     # Oecusse and Atauro Island are excluded from the model
     load_distribution = {
@@ -310,38 +325,60 @@ def add_loads_to_network(network, load_csv_path=r"data\timor_leste_hourly_load_2
         "Suai": 0.062,
         "Betano": 0.052,
     }
-    
-    # Read the default load profile
-    default_load = pd.read_csv(load_csv_path)
-    
-    # Get snapshots from the network
+
     snapshots = network.snapshots
-    
-    # Set the index to match the network snapshots if lengths match
-    if len(default_load) == len(snapshots):
-        default_load.drop(columns=['Time'], inplace=True)
-        default_load.index = snapshots.copy()
-        default_load.index.name = snapshots.name
+    load_mode = getattr(config, "LOAD_MODE", "csv")
+    print(f"  Load mode: {load_mode}")
+
+    if load_mode == "random":
+        profiles = build_random_load_profiles(
+            snapshots=snapshots,
+            load_distribution=load_distribution,
+            config_dict=config.LOAD_RANDOM_CONFIG,
+        )
+        if output_dir is not None:
+            export_load_profiles(profiles, output_dir, scenario_name=scenario_name)
+
+        for bus, p_set in profiles.items():
+            if bus in network.buses.index:
+                network.add(
+                    "Load",
+                    f"Load_{bus}",
+                    bus=bus,
+                    p_set=p_set,
+                )
     else:
-        print(f"Warning: Load data length ({len(default_load)}) does not match snapshots length ({len(snapshots)})")
-        print("Please check the input data.")
-        return
-    
-    # Add loads to each bus
-    for bus, population_factor in load_distribution.items():
-        if bus in network.buses.index:
-            # Multiply the default load profile by population factor for this bus
-            bus_load_profile = default_load['Demand'] * population_factor
-            
-            network.add(
-                "Load",
-                f"Load_{bus}",
-                bus=bus,
-                p_set=bus_load_profile,
-            )
-    
+        # Read the default load profile (CSV mode)
+        default_load = pd.read_csv(load_csv_path)
+
+        # Set the index to match the network snapshots if lengths match
+        if len(default_load) == len(snapshots):
+            default_load.drop(columns=['Time'], inplace=True)
+            default_load.index = snapshots.copy()
+            default_load.index.name = snapshots.name
+        else:
+            print(f"Warning: Load data length ({len(default_load)}) does not match snapshots length ({len(snapshots)})")
+            print("Please check the input data.")
+            return
+
+        csv_profiles = {}
+        for bus, population_factor in load_distribution.items():
+            if bus in network.buses.index:
+                bus_load_profile = (default_load['Demand'] * population_factor).rename(f"Load_{bus}")
+                network.add(
+                    "Load",
+                    f"Load_{bus}",
+                    bus=bus,
+                    p_set=bus_load_profile,
+                )
+                csv_profiles[bus] = bus_load_profile
+
+        if output_dir is not None:
+            export_load_profiles(csv_profiles, output_dir, scenario_name=scenario_name)
+
     print(f"  Added {len(network.loads)} loads")
-    print(f"  Average load: {network.loads_t.p_set.sum(axis=1).mean():.1f} MW")
+    if not network.loads.empty:
+        print(f"  Average load: {network.loads_t.p_set.sum(axis=1).mean():.1f} MW")
 
 
 def get_network_statistics(network):
