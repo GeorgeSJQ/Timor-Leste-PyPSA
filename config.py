@@ -10,23 +10,23 @@ from pypsa.common import annuity
 # MODEL HORIZON
 # ============================================================================
 
-MODEL_START_YEAR = 2025
+MODEL_START_YEAR = 2026
 MODEL_END_YEAR = 2046   # exclusive right boundary — last investment period is MODEL_END_YEAR - 1
-INVESTMENT_PERIODS = list(range(2025, 2046))   # 2025 through 2045 inclusive
+INVESTMENT_PERIODS = list(range(2026, 2046))   # 2026 through 2045 inclusive
 FREQ = "1h"
 
 # ============================================================================
 # SIMULATION PARAMETERS (single-year / legacy)
 # ============================================================================
 
-SIMULATION_START_YEAR = 2025
-SIMULATION_END_YEAR = 2025
+SIMULATION_START_YEAR = 2026
+SIMULATION_END_YEAR = 2026
 
 HOURS_PER_YEAR = 8760
 RESOLUTION = 1
 
-SNAPSHOTS_START = "2025-01-01 00:00"
-SNAPSHOTS_END = "2025-12-31 23:00"
+SNAPSHOTS_START = "2026-01-01 00:00"
+SNAPSHOTS_END = "2026-12-31 23:00"
 
 # ============================================================================
 # OPTIMISATION SETTINGS
@@ -74,6 +74,15 @@ CO2_PRICE = 0.0  # USD/tCO2
 # CARRIER DEFINITIONS
 # ============================================================================
 
+# Carrier emissions are thermal fuel factors in tCO2-e/MWh_th for PyPSA primary
+# energy accounting. Scope 1 fuel factors are from Australia's 2025 National
+# Greenhouse Accounts Factors, converted from kg CO2-e/GJ by multiplying by 3.6
+# and dividing by 1000.
+NATURAL_GAS_CO2_T_PER_MWH_TH = 0.1855
+DIESEL_CO2_T_PER_MWH_TH = 0.2527
+FUEL_OIL_CO2_T_PER_MWH_TH = 0.2658
+BLACK_COAL_CO2_T_PER_MWH_TH = 0.3249
+
 CARRIERS = {
     "AC": {
         "color": "#4169E1",
@@ -111,26 +120,26 @@ CARRIERS = {
         "nice_name": "Hydropower",
         "co2_emissions": 0.0,
         "capital_cost_unit": "USD/MW",
-        "lifetime": 80,
+        "lifetime": 40,
     },
     "battery": {
         "color": "#9370DB",
         "nice_name": "Battery Storage",
         "co2_emissions": 0.0,
         "capital_cost_unit": "USD/MW",
-        "lifetime": 15,
+        "lifetime": 20,
     },
     "pumped_hydro": {
         "color": "#4169E1",
         "nice_name": "Pumped Hydro Storage",
         "co2_emissions": 0.0,
         "capital_cost_unit": "USD/MW",
-        "lifetime": 50,
+        "lifetime": 40,
     },
     "OCGT": {
         "color": "#CD853F",
         "nice_name": "Open Cycle Gas Turbine",
-        "co2_emissions": 0.45,
+        "co2_emissions": NATURAL_GAS_CO2_T_PER_MWH_TH,
         "fuel": "natural_gas",
         "capital_cost_unit": "USD/MW",
         "lifetime": 25,
@@ -138,7 +147,7 @@ CARRIERS = {
     "CCGT": {
         "color": "#D2691E",
         "nice_name": "Combined Cycle Gas Turbine",
-        "co2_emissions": 0.45,
+        "co2_emissions": NATURAL_GAS_CO2_T_PER_MWH_TH,
         "fuel": "natural_gas",
         "capital_cost_unit": "USD/MW",
         "lifetime": 25,
@@ -146,31 +155,31 @@ CARRIERS = {
     "reciprocating_engine": {
         "color": "#A0522D",
         "nice_name": "Reciprocating Engine",
-        "co2_emissions": 0.45,
-        "fuel": "natural_gas",
+        "co2_emissions": DIESEL_CO2_T_PER_MWH_TH,
+        "fuel": "diesel",
         "capital_cost_unit": "USD/MW",
-        "lifetime": 20,
+        "lifetime": 25,
     },
     "coal": {
         "color": "#2F4F4F",
         "nice_name": "Coal Generator",
-        "co2_emissions": 0.98,
+        "co2_emissions": BLACK_COAL_CO2_T_PER_MWH_TH,
         "fuel": "coal",
         "capital_cost_unit": "USD/MW",
-        "lifetime": 40,
+        "lifetime": 30,
     },
     "diesel": {
         "color": "#8B4513",
         "nice_name": "Diesel Generator",
-        "co2_emissions": 0.65,  # tCO2/MWh_th
+        "co2_emissions": DIESEL_CO2_T_PER_MWH_TH,
         "fuel": "diesel",
         "capital_cost_unit": "USD/MW",
-        "lifetime": 20,
+        "lifetime": 25,
     },
     "oil": {
         "color": "#696969",
         "nice_name": "Oil Generator",
-        "co2_emissions": 0.65,
+        "co2_emissions": FUEL_OIL_CO2_T_PER_MWH_TH,
         "fuel": "oil",
         "capital_cost_unit": "USD/MW",
         "lifetime": 30,
@@ -178,7 +187,7 @@ CARRIERS = {
     "natural_gas": {
         "color": "#FFA500",
         "nice_name": "Natural Gas",
-        "co2_emissions": 0.0,
+        "co2_emissions": NATURAL_GAS_CO2_T_PER_MWH_TH,
     },
     "hydrogen": {
         "color": "#FF1493",
@@ -198,48 +207,76 @@ THERMAL_CARRIERS = ["diesel", "OCGT", "CCGT"]
 # TECHNOLOGY COST DATA (USD)
 # ============================================================================
 
-# Build costs (USD/MW for generators, USD/MVA for lines/transformers)
-# These are 2025 base costs for Timor-Leste, reflecting island import premiums.
+# Build costs (USD/MW for generators, USD/MWh for storage energy,
+# USD/MVA/km for lines, USD/MVA for transformers).
+# Source basis: user-supplied Australian technology workbook, converted from
+# $/kW to USD/MW and uplifted 1.15x for Timor-Leste import/logistics and
+# small-system delivery. Diesel and transmission costs are planning estimates
+# until local EPC bid data is available.
 BUILD_COSTS = {
-    "solar": 1_200_000,        # USD/MW
-    "wind_onshore": 2_200_000,  # USD/MW
-    "wind_offshore": 3_500_000,  # USD/MW
-    "battery": 500_000,         # USD/MW (power capacity)
-    "battery_energy": 400_000,  # USD/MWh (energy capacity)
-    "OCGT": 900_000,            # USD/MW
-    "CCGT": 1_600_000,          # USD/MW
-    "reciprocating_engine": 1_000_000,  # USD/MW
-    "coal": 2_000_000,          # USD/MW
-    "diesel": 1_000_000,        # USD/MW
-    "line": 0,                  # USD/MVA/km
-    "transformer": 0,           # USD/MVA
+    "solar": 1_322_500,
+    "wind_onshore": 3_507_500,
+    "wind_offshore": 4_951_900,
+    "hydro": 6_037_500,
+    "pumped_hydro": 8_050_000,
+    "battery": 603_750,
+    "battery_energy": 315_100,
+    "OCGT": 2_521_950,
+    "CCGT": 2_714_000,
+    "reciprocating_engine": 2_185_000,
+    "coal": 5_785_650,
+    "diesel": 1_600_000,
+    "line": 6_000,
+    "transformer": 30_000,
 }
 
 # Fixed O&M costs (USD/MW/year)
 FIXED_OM_COSTS = {
     "solar": 12_000,
-    "wind_onshore": 35_000,
-    "wind_offshore": 90_000,
-    "battery": 20_000,
-    "OCGT": 12_000,
-    "CCGT": 15_000,
-    "reciprocating_engine": 18_000,
-    "coal": 20_000,
-    "diesel": 20_000,
+    "wind_onshore": 28_000,
+    "wind_offshore": 174_573,
+    "hydro": 105_000,
+    "pumped_hydro": 95_000,
+    "battery": 12_800,
+    "OCGT": 17_368,
+    "CCGT": 15_028,
+    "reciprocating_engine": 29_383,
+    "coal": 64_851,
+    "diesel": 29_383,
 }
 
 # Marginal costs (USD/MWh)
-# Diesel: ~$0.90/L fuel price × 0.27 L/kWh heat rate ≈ $243/MWh fuel + $10 VOM
+# Thermal costs include fuel plus workbook variable O&M. Diesel uses the 2026
+# Timor-Leste temporary retail cap of USD 1.65/L as a conservative fuel-price
+# proxy; gas/coal are imported-fuel planning assumptions until local supply
+# contracts exist.
+FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ = {
+    "imported_lng": 16.0,
+    "imported_coal": 6.0,
+    "diesel": 1.65 * 1000 / 38.6,
+}
+
+MWH_TH_TO_GJ = 3.6
+THERMAL_FUEL_USE_GJ_PER_MWH = {
+    "OCGT": MWH_TH_TO_GJ / 0.343,
+    "CCGT": MWH_TH_TO_GJ / 0.509,
+    "reciprocating_engine": MWH_TH_TO_GJ / 0.409,
+    "coal": MWH_TH_TO_GJ / 0.4212,
+    "diesel": MWH_TH_TO_GJ / 0.40,
+}
+
 MARGINAL_COSTS = {
     "solar": 0.5,
     "wind_onshore": 0.5,
-    "wind_offshore": 0.7,
+    "wind_offshore": 0.5,
+    "hydro": 0.5,
+    "pumped_hydro": 0.5,
     "battery": 0.5,
-    "OCGT": 180.0,
-    "CCGT": 100.0,
-    "reciprocating_engine": 200.0,
-    "coal": 120.0,
-    "diesel": 250.0,
+    "OCGT": THERMAL_FUEL_USE_GJ_PER_MWH["OCGT"] * FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ["imported_lng"] + 16.1, # $184.03/MWh
+    "CCGT": THERMAL_FUEL_USE_GJ_PER_MWH["CCGT"] * FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ["imported_lng"] + 4.1, # $117.26/MWh
+    "reciprocating_engine": THERMAL_FUEL_USE_GJ_PER_MWH["reciprocating_engine"] * FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ["diesel"] + 8.51, # $384.76/MWh
+    "coal": THERMAL_FUEL_USE_GJ_PER_MWH["coal"] * FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ["imported_coal"] + 4.68, # $55.96/MWh
+    "diesel": 270 # THERMAL_FUEL_USE_GJ_PER_MWH["diesel"] * FUEL_PRICE_ASSUMPTIONS_USD_PER_GJ["diesel"] + 8.51, # $393.23/MWh
 }
 
 # ============================================================================
@@ -250,66 +287,107 @@ TECHNICAL_PARAMS = {
     "solar": {
         "efficiency": 1.0,
         "lifetime": 25,
+        "p_min_pu": 0.0,
+        "forced_outage_rate": 0.015,
     },
     "wind_onshore": {
         "efficiency": 1.0,
         "lifetime": 25,
+        "p_min_pu": 0.0,
+        "forced_outage_rate": 0.025,
     },
     "wind_offshore": {
         "efficiency": 1.0,
         "lifetime": 25,
+        "p_min_pu": 0.0,
+        "forced_outage_rate": 0.05,
+    },
+    "hydro": {
+        "efficiency": 0.90,
+        "lifetime": 40,
+        "ramp_limit_up": 1.0,
+        "ramp_limit_down": 1.0,
+        "p_min_pu": 0.4,
+        "forced_outage_rate": 0.015,
+    },
+    "pumped_hydro": {
+        "efficiency": 0.775,
+        "lifetime": 40,
+        "max_hours": 10.0,
+        "ramp_limit_up": 1.0,
+        "ramp_limit_down": 1.0,
+        "p_min_pu": 0.4,
+        "forced_outage_rate": 0.015,
     },
     "battery": {
-        "lifetime": 15,
-        "efficiency_charge": 0.95,
-        "efficiency_discharge": 0.95,
+        "lifetime": 20,
+        "efficiency_charge": 0.925,
+        "efficiency_discharge": 0.925,
         "max_hours": 4.0,
         "standing_loss": 0.0001,
+        "soc_max": 1.0,
+        "soc_min": 0.0,
+        "cycle_life": 7300,
+        "depth_of_discharge": 1.0,
+        "forced_outage_rate": 0.015,
     },
     "OCGT": {
         "lifetime": 25,
-        "efficiency": 0.39,
-        "ramp_limit_up": 0.5,
-        "ramp_limit_down": 0.5,
+        "efficiency": 0.343,
+        "heat_rate_min_gj_per_mwh": 14.629,
+        "heat_rate_max_gj_per_mwh": 10.489,
+        "ramp_limit_up": 1.0,
+        "ramp_limit_down": 1.0,
         "min_up_time": 1,
         "min_down_time": 1,
-        "p_min_pu": 0.0,
+        "p_min_pu": 0.5,
+        "forced_outage_rate": 0.02,
     },
     "CCGT": {
         "lifetime": 25,
-        "efficiency": 0.58,
-        "ramp_limit_up": 0.2,
-        "ramp_limit_down": 0.2,
+        "efficiency": 0.509,
+        "heat_rate_min_gj_per_mwh": 8.271,
+        "heat_rate_max_gj_per_mwh": 7.068,
+        "ramp_limit_up": 1.0,
+        "ramp_limit_down": 1.0,
         "min_up_time": 4,
         "min_down_time": 4,
-        "p_min_pu": 0.4,
+        "p_min_pu": 0.46,
+        "forced_outage_rate": 0.035,
     },
     "reciprocating_engine": {
-        "lifetime": 20,
-        "efficiency": 0.42,
+        "lifetime": 25,
+        "efficiency": 0.409,
+        "heat_rate_min_gj_per_mwh": 11.356,
+        "heat_rate_max_gj_per_mwh": 8.79,
         "ramp_limit_up": 1.0,
         "ramp_limit_down": 1.0,
         "min_up_time": 0,
         "min_down_time": 0,
-        "p_min_pu": 0.3,
+        "p_min_pu": 0.4,
+        "forced_outage_rate": 0.02,
     },
     "coal": {
-        "lifetime": 40,
-        "efficiency": 0.37,
-        "ramp_limit_up": 0.05,
-        "ramp_limit_down": 0.05,
+        "lifetime": 30,
+        "efficiency": 0.4212,
+        "heat_rate_min_gj_per_mwh": 10.172,
+        "heat_rate_max_gj_per_mwh": 8.548,
+        "ramp_limit_up": 1.0,
+        "ramp_limit_down": 1.0,
         "min_up_time": 8,
         "min_down_time": 8,
-        "p_min_pu": 0.4,
+        "p_min_pu": 0.3,
+        "forced_outage_rate": 0.04,
     },
     "diesel": {
-        "lifetime": 20,
+        "lifetime": 25,
         "efficiency": 0.40,
         "ramp_limit_up": 1.0,
         "ramp_limit_down": 1.0,
         "min_up_time": 0,
         "min_down_time": 0,
         "p_min_pu": 0.2,
+        "forced_outage_rate": 0.02,
     },
 }
 
@@ -318,6 +396,8 @@ CAPITAL_COSTS = {
     "solar": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["solar"]["lifetime"]) * BUILD_COSTS["solar"] + FIXED_OM_COSTS["solar"],
     "wind_onshore": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["wind_onshore"]["lifetime"]) * BUILD_COSTS["wind_onshore"] + FIXED_OM_COSTS["wind_onshore"],
     "wind_offshore": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["wind_offshore"]["lifetime"]) * BUILD_COSTS["wind_offshore"] + FIXED_OM_COSTS["wind_offshore"],
+    "hydro": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["hydro"]["lifetime"]) * BUILD_COSTS["hydro"] + FIXED_OM_COSTS["hydro"],
+    "pumped_hydro": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["pumped_hydro"]["lifetime"]) * BUILD_COSTS["pumped_hydro"] + FIXED_OM_COSTS["pumped_hydro"],
     "battery": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["battery"]["lifetime"]) * BUILD_COSTS["battery"] + FIXED_OM_COSTS["battery"],
     "battery_energy": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["battery"]["lifetime"]) * BUILD_COSTS["battery_energy"] + FIXED_OM_COSTS["battery"],
     "OCGT": annuity(DISCOUNT_RATE, TECHNICAL_PARAMS["OCGT"]["lifetime"]) * BUILD_COSTS["OCGT"] + FIXED_OM_COSTS["OCGT"],
@@ -387,6 +467,71 @@ COST_PROJECTION_FACTORS = COST_PROJECTION_SETS["default"]
 # inclusive date range. Multiple modifiers compound (overlaps stack).
 # Omit the key (or set to None) to keep the static base price.
 
+# ============================================================================
+# NEW-BUILD BUS PLACEMENT
+# ============================================================================
+# NEW_BUILD_BUSES restricts where each technology may be built. Each key is a
+# carrier (must be in CARRIERS) and each value is a list of buses (must exist
+# in timor_leste_config.SUBSTATIONS or POWER_PLANTS). The model adds one
+# extendable cohort per (technology, bus, valid build year) — so a tech with
+# two listed buses produces two separate generators per build year, each with
+# its own p_max_pu trace.
+#
+# Per-scenario overrides: a scenario in SCENARIOS may set its own
+# "new_build_buses" key with the same shape; that dict completely replaces
+# the global NEW_BUILD_BUSES for that scenario.
+#
+# A technology may appear in `allowed_generators` but be absent here (or have
+# an empty list); in that case no new cohorts of that tech are built.
+
+NEW_BUILD_BUSES = {
+    "solar":        ["Dili", "Baucau", "Manatuto", "Viqueque", "Betano"],
+    "wind_onshore": ["Dili", "Baucau", "Manatuto", "Viqueque", "Betano"],
+    "battery":      ["Dili", "Baucau", "Manatuto", "Viqueque", "Betano"],
+}
+
+# Optional per-bus capacity caps for new-build cohorts. Shape:
+#   {technology: {bus: max_mw, ...}, ...}
+# A bus absent from this dict has no cap (p_nom_max = inf).
+# Cap is applied PER COHORT (per build year). To cap total across cohorts,
+# either restrict to one build year (lifetime ≥ horizon) or accept the
+# per-cohort interpretation.
+#
+# Per-scenario overrides: scenarios may set "max_bus_capacity" with the same
+# shape to fully replace the global dict.
+
+MAX_BUS_CAPACITY = {
+    "solar":        {},
+    "wind_onshore": {},
+    "battery":      {},
+}
+
+# Per-bus Renewables Ninja CSV paths, used only when
+# VRE_TRACE_SOURCE == "renewables_ninja". Buses absent from this dict fall
+# back to the single default CSV (data/solar_pv_output_re_ninja.csv or
+# data/wind_output_re_ninja.csv). Has no effect in atlite mode, which
+# always uses the per-bus traces from the cutout.
+#
+# Per-scenario overrides: scenarios may set "renewables_ninja_csv_paths"
+# with the same shape to fully replace the global dict.
+
+RENEWABLES_NINJA_CSV_PATHS = {
+    "solar": {
+        "Dili": r"data\solar_pv_output_re_ninja_dili.csv",
+        "Baucau": r"data\solar_pv_output_re_ninja_baucau.csv",
+        "Manatuto": r"data\solar_pv_output_re_ninja_manatuto.csv",
+        "Viqueque": r"data\solar_pv_output_re_ninja_viqueque.csv",
+        "Betano": r"data\solar_pv_output_re_ninja_betano.csv",
+    },
+    "wind_onshore": {
+        "Dili": r"data\wind_output_re_ninja_dili.csv",
+        "Baucau": r"data\wind_output_re_ninja_baucau.csv",
+        "Manatuto": r"data\wind_output_re_ninja_manatuto.csv",
+        "Viqueque": r"data\wind_output_re_ninja_viqueque.csv",
+        "Betano": r"data\wind_output_re_ninja_betano.csv",
+    },
+}
+
 SCENARIOS = {
     "base": {
         "description": "Base case — current diesel + RE investment allowed",
@@ -427,7 +572,25 @@ SCENARIOS = {
         "allowed_generators": ["solar", "wind_onshore", "battery", "diesel"],
         "cost_projection": "default",
     },
+    "nation_wide_plan": {
+        "description": "Solar and battery from 2026, onshore wind from 2028, custom random city loads, new build allowed at 5 cities",
+        "fuel_price_trajectories": None,
+        "demand_growth_rate": 0.3,
+        "allowed_generators": ["solar", "battery", "wind_onshore", "diesel"],
+        "cost_projection": "default",
+        "new_build_buses": NEW_BUILD_BUSES,
+        "renewables_ninja_csv_paths": RENEWABLES_NINJA_CSV_PATHS
+    },
+
 }
+
+TECHNOLOGY_BUILD_START_YEARS = {
+    "solar": 2026,
+    "battery": 2026,
+    "wind_onshore": 2028,
+    "diesel": 2025,
+}
+
 
 # ============================================================================
 # VRE TRACE SOURCE
@@ -493,13 +656,13 @@ ATLITE_CONFIG = {
 #              by load_distribution. Same daily profile is reused every day.
 #              Demand growth is NOT applied in this mode.
 
-LOAD_MODE = "csv"
+LOAD_MODE = "random"
 
 # Settings used only when LOAD_MODE == "random".
 # system-level peak/min are scaled per bus by the load_distribution shares
 # in timor_leste_config.add_loads_to_network / build_multiperiod_network.
 LOAD_RANDOM_CONFIG = {
-    "peak_mw": 110.0,                  # system-wide peak (MW) before scaling per bus
+    "peak_mw": 70,                  # system-wide peak (MW) before scaling per bus
     "min_mw": 35.0,                    # system-wide overnight min (MW)
     "seed": 42,                        # integer seed for np.random.SeedSequence
 
@@ -513,7 +676,10 @@ LOAD_RANDOM_CONFIG = {
     # Buses listed here use 24 fully random hourly values (uniform between
     # min_mw and peak_mw) instead of the typical-shape template, then go
     # through the same seasonal/noise/scaling pipeline as the others.
-    "fully_random_buses": [],
+    "fully_random_buses": [
+        "Dili", "Baucau", "Maliana", "Liquica", "Manatuto",
+        "Lospalos", "Viqueque", "Cassa", "Suai"
+    ],
 
     # Seasonal multiplier applied to every timestep based on its month.
     # Default uses meteorological seasons (DJF/MAM/JJA/SON).

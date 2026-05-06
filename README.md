@@ -188,6 +188,78 @@ Set `allowed_generators` to only the carriers you want to allow for **new** inve
 
 Note: `"diesel"` should remain in this list to keep the existing Betano and Hera plants operational. New extendable diesel generators are not added by the model regardless.
 
+### Restricting where new builds can be placed
+
+By default, every model run adds one extendable cohort of solar at Dili, wind at Lospalos, and battery at Dili — matching the original network topology. To allow new builds at additional buses (or restrict them to a different single bus), edit `NEW_BUILD_BUSES` in `config.py`:
+
+```python
+NEW_BUILD_BUSES = {
+    "solar":        ["Dili", "Baucau", "Suai"],     # 3 candidate sites
+    "wind_onshore": ["Lospalos", "Viqueque"],       # 2 candidate sites
+    "battery":      ["Dili", "Baucau"],             # battery placement is independent
+}
+```
+
+For each `(technology, bus, valid_build_year)` triple the model adds one extendable cohort named `Solar_<bus>_<year>` / `Wind_<bus>_<year>` / `Battery_<bus>_<year>`. Each cohort uses the bus's own VRE trace (atlite per-bus capacity factor; see [VRE traces](#vre-traces-renewables-ninja-or-atlite)) or, in `renewables_ninja` mode, the default CSV unless a per-bus CSV is configured (see below).
+
+Buses must exist in `timor_leste_config.SUBSTATIONS` or `POWER_PLANTS` (currently 9 substations + Betano + Hera = 11 buses).
+
+#### Per-bus capacity caps
+
+Set a maximum installed capacity per cohort per bus (MW):
+
+```python
+MAX_BUS_CAPACITY = {
+    "solar":        {"Baucau": 50.0, "Suai": 30.0},   # MW per cohort
+    "wind_onshore": {"Lospalos": 150.0},
+    "battery":      {},
+}
+```
+
+A bus absent from this dict is unbounded. The cap applies **per cohort** (per build year) — if multiple build years are valid for a tech and you want a total cap across cohorts, either restrict the build years or accept the per-cohort interpretation.
+
+#### Per-bus Renewables Ninja CSVs
+
+When `VRE_TRACE_SOURCE = "renewables_ninja"` and you have multiple solar/wind buses, you can supply a different CSV per bus:
+
+```python
+RENEWABLES_NINJA_CSV_PATHS = {
+    "solar": {
+        "Dili":   r"data\solar_pv_output_re_ninja_dili.csv",
+        "Baucau": r"data\solar_pv_output_re_ninja_baucau.csv",
+    },
+    "wind_onshore": {
+        "Lospalos": r"data\wind_output_re_ninja_lospalos.csv",
+    },
+}
+```
+
+Buses absent from this dict fall back to the default `data/solar_pv_output_re_ninja.csv` / `data/wind_output_re_ninja.csv`. Has no effect in `atlite` mode, which always uses the per-bus traces from the cutout.
+
+#### Per-scenario overrides
+
+Any scenario can override these globals by setting `new_build_buses`, `max_bus_capacity`, or `renewables_ninja_csv_paths`. The scenario-level dict completely replaces the corresponding global dict for that scenario only — it is not deep-merged.
+
+```python
+SCENARIOS["solar_north_only"] = {
+    "description":          "Solar built only at Liquica, Dili, Baucau",
+    "fuel_price_trajectories": None,
+    "demand_growth_rate":   0.03,
+    "allowed_generators":   ["solar", "battery", "diesel"],
+    "cost_projection":      "default",
+    "new_build_buses": {
+        "solar":        ["Liquica", "Dili", "Baucau"],
+        "wind_onshore": [],          # no new wind even though it's in allowed_generators
+        "battery":      ["Dili"],
+    },
+    "max_bus_capacity": {
+        "solar": {"Liquica": 80.0, "Baucau": 60.0},
+    },
+}
+```
+
+A technology may appear in `allowed_generators` but be absent from `new_build_buses` (or have an empty bus list); in that case no new cohorts of that tech are built. Conversely, listing a bus in `new_build_buses` but excluding the tech from `allowed_generators` builds nothing — `allowed_generators` is the gate.
+
 ---
 
 ## Fuel price trajectories
@@ -525,23 +597,33 @@ The two-stage logic lives in `run.py::_run_two_stage_rolling_horizon()`.
 
 ## Technology Costs
 
-All technology costs are in **USD** and are set in `config.py`.
+All technology costs are in **USD** and are set in `config.py`. The current assumptions use the Australian technology-cost workbook as the engineering baseline, then apply a `1.15x` uplift to overnight build costs to reflect Timor-Leste import logistics, smaller project scale, and island delivery risk.
 
-### Base capital costs (`BUILD_COSTS`)
+### Base build costs (`BUILD_COSTS`)
 
-These are 2025 overnight capital costs per MW of installed capacity, reflecting island import premiums applicable to Timor-Leste:
+`BUILD_COSTS` are 2025 overnight costs. Generators are in `USD/MW`, battery energy capacity is in `USD/MWh`, lines are in `USD/MVA/km`, and transformers are in `USD/MVA`.
 
 ```python
 BUILD_COSTS = {
-    "solar":         1_200_000,   # USD/MW
-    "wind_onshore":  2_200_000,   # USD/MW
-    "battery":         500_000,   # USD/MW  (power capacity)
-    "battery_energy":  400_000,   # USD/MWh (energy capacity)
+    "solar":          1_322_500,
+    "wind_onshore":   3_507_500,
+    "wind_offshore":  4_951_900,
+    "hydro":          6_037_500,
+    "pumped_hydro":   8_050_000,
+    "battery":          603_750,   # power capacity, USD/MW
+    "battery_energy":   315_100,   # energy capacity, USD/MWh
+    "OCGT":           2_521_950,
+    "CCGT":           2_714_000,
+    "diesel":         1_600_000,
+    "line":               6_000,   # indicative only
+    "transformer":       30_000,   # indicative only
     ...
 }
 ```
 
 The model **never uses these raw figures directly** for multi-period investment. Instead, `get_annualized_capex()` in `model_builder.py` applies a year-specific cost projection factor (see [Cost Projections](#cost-projections)), then annualises the result with the annuity formula and adds fixed O&M.
+
+Line and transformer build-cost entries are retained for future transmission expansion analysis, but `CAPITAL_COSTS["line"]` and `CAPITAL_COSTS["transformer"]` are intentionally kept at `0` for now.
 
 ### Fixed O&M costs (`FIXED_OM_COSTS`)
 
@@ -549,28 +631,49 @@ Annual fixed operation and maintenance costs per MW of installed capacity:
 
 ```python
 FIXED_OM_COSTS = {
-    "solar":        12_000,   # USD/MW/year
-    "wind_onshore": 35_000,   # USD/MW/year
-    "battery":      20_000,   # USD/MW/year
+    "solar":        12_000,
+    "wind_onshore": 28_000,
+    "battery":      12_800,
+    "OCGT":         17_368,
+    "CCGT":         15_028,
+    "diesel":       29_383,
     ...
 }
 ```
 
-### Marginal (variable) costs (`MARGINAL_COSTS`)
+### Marginal costs (`MARGINAL_COSTS`)
 
-Short-run marginal costs per MWh of generated electricity. For diesel, this includes fuel at approximately USD 0.90/L:
+Short-run marginal costs are in `USD/MWh_e`. For thermal generators, fuel prices are stored as `USD/GJ` and converted to electrical output with:
 
 ```python
-MARGINAL_COSTS = {
-    "solar":        0.5,    # USD/MWh
-    "wind_onshore": 0.5,    # USD/MWh
-    "battery":      0.5,    # USD/MWh
-    "diesel":     250.0,    # USD/MWh (fuel + VOM)
-    ...
-}
+fuel_cost_usd_per_mwh = fuel_price_usd_per_gj * (3.6 / efficiency)
+marginal_cost = fuel_cost_usd_per_mwh + variable_om_usd_per_mwh
 ```
 
-To change the base diesel fuel price, edit `MARGINAL_COSTS["diesel"]` directly. Per-scenario time-varying price changes (ramps, step-ups, spikes) are configured via the scenario's `fuel_price_trajectories` key — see [Fuel price trajectories](#fuel-price-trajectories).
+The current base thermal marginal costs are approximately:
+
+| Carrier | Base marginal cost |
+|---|---:|
+| `OCGT` | 184.03 USD/MWh |
+| `CCGT` | 117.26 USD/MWh |
+| `reciprocating_engine` | 384.76 USD/MWh |
+| `coal` | 55.96 USD/MWh |
+| `diesel` | 393.23 USD/MWh |
+
+Diesel uses a fuel-price proxy of `USD 1.65/L`, converted to `USD/GJ` using `38.6 GJ/kL`. Per-scenario time-varying price changes are configured via `fuel_price_trajectories` and multiply the base `MARGINAL_COSTS` series; see [Fuel price trajectories](#fuel-price-trajectories).
+
+### Emissions factors (`CARRIERS`)
+
+Carrier `co2_emissions` values are thermal fuel factors in `tCO2-e/MWh_th`, used by PyPSA primary-energy emissions accounting:
+
+```python
+NATURAL_GAS_CO2_T_PER_MWH_TH = 0.1855
+DIESEL_CO2_T_PER_MWH_TH = 0.2527
+FUEL_OIL_CO2_T_PER_MWH_TH = 0.2658
+BLACK_COAL_CO2_T_PER_MWH_TH = 0.3249
+```
+
+These are converted from Australia National Greenhouse Accounts fuel factors in `kg CO2-e/GJ` using `kg/GJ * 3.6 / 1000`.
 
 ### Technical parameters (`TECHNICAL_PARAMS`)
 
@@ -578,16 +681,19 @@ Asset lifetimes, efficiencies, and operational limits:
 
 ```python
 TECHNICAL_PARAMS = {
-    "solar":        {"efficiency": 1.0, "lifetime": 25},
-    "wind_onshore": {"efficiency": 1.0, "lifetime": 25},
-    "battery":      {"lifetime": 15, "efficiency_charge": 0.95,
-                     "efficiency_discharge": 0.95, "max_hours": 4.0, ...},
-    "diesel":       {"lifetime": 20, "efficiency": 0.40, ...},
+    "solar":   {"efficiency": 1.0, "lifetime": 30, "forced_outage_rate": 0.015},
+    "battery": {"lifetime": 20, "efficiency_charge": 0.925,
+                "efficiency_discharge": 0.925, "max_hours": 4.0, ...},
+    "OCGT":    {"lifetime": 25, "efficiency": 0.343, "p_min_pu": 0.5, ...},
+    "CCGT":    {"lifetime": 25, "efficiency": 0.509, "p_min_pu": 0.46, ...},
+    "diesel":  {"lifetime": 25, "efficiency": 0.40, "p_min_pu": 0.2, ...},
     ...
 }
 ```
 
 `lifetime` determines how many years an asset built in a given investment period remains eligible to generate. When an asset's lifetime expires, PyPSA stops building on it and the model can invest in a new cohort.
+
+Note: some technical parameters such as ramp rate can only be used when the generator has fixed capacity.
 
 ### Discount rate
 
@@ -770,6 +876,14 @@ n.import_from_netcdf("results/base/optimized_network.nc")
 | `data/timor_leste_hourly_load_2025.csv` | 8760-row hourly electricity demand (MW), representative year |
 | `data/solar_pv_output_re_ninja.csv` | 8760-row hourly solar PV capacity factors (0–1) from Renewables Ninja |
 | `data/wind_output_re_ninja.csv` | 8760-row hourly onshore wind capacity factors (0–1) from Renewables Ninja |
+| `C:/Users/georg/Downloads/technical_parameters.xlsx` | Australian technology-cost and technical-parameter workbook used as the baseline for `BUILD_COSTS`, `FIXED_OM_COSTS`, variable O&M, and `TECHNICAL_PARAMS` |
+
+Additional parameter sources used in `config.py`:
+
+- [Australia National Greenhouse Accounts Factors 2025](https://www.dcceew.gov.au/climate-change/publications/national-greenhouse-accounts-factors-2025) for thermal fuel emissions factors.
+- [Timor-Leste 2026 temporary fuel price cap](https://timor-leste.gov.tl/?lang=en&n=1&p=48029) (`USD 1.65/L`) as the diesel fuel-price proxy.
+- [Timor-Leste Solar and BESS project public information](https://www.miga.org/project/timor-leste-solar-and-bess) for local context on solar-plus-storage development.
+- [AEMO Transmission Cost Database](https://www.aemo.com.au/energy-systems/major-publications/integrated-system-plan-isp/2026-integrated-system-plan-isp/2025-26-inputs-assumptions-and-scenarios/transmission-cost-database) as a reference point for indicative line and transformer costs; these are not yet active in `CAPITAL_COSTS`.
 
 Renewables Ninja CSVs must have columns `Time` (UTC timestamps) and `Output` (capacity factor). The model converts timestamps from UTC to Timor-Leste local time (`Asia/Dili`, UTC+9) before tiling across the multi-year horizon.
 
