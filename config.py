@@ -40,6 +40,30 @@ SOLVER_OPTIONS = {
 }
 
 # ============================================================================
+# ROLLING-HORIZON OPTIMISATION
+# ============================================================================
+# When enabled, run.py does a two-stage solve:
+#   Stage 1 — full-horizon investment solve (single LP) to pick optimal
+#             capacities (p_nom_opt) for every extendable asset.
+#   Stage 2 — capacities frozen (p_nom_extendable=False, p_nom = p_nom_opt),
+#             then PyPSA's optimize_with_rolling_horizon() solves operations
+#             window-by-window, carrying SOC / store energy between windows.
+#
+# This is the only way to get meaningful rolling-horizon results in an
+# investment-planning model: a naive call to optimize_with_rolling_horizon()
+# with p_nom_extendable=True would let each window pick its own capacity,
+# which destroys the investment decision.
+#
+# `horizon` and `overlap` are in *number of snapshots*, not hours. With
+# FREQ="1h" they are equivalent.
+
+ROLLING_HORIZON = {
+    "enabled": False,
+    "horizon": 168,    # 1 week per dispatch window (168 hourly snapshots)
+    "overlap": 24,     # 24 h overlap between windows for SOC continuity
+}
+
+# ============================================================================
 # ECONOMIC PARAMETERS
 # ============================================================================
 
@@ -355,43 +379,153 @@ COST_PROJECTION_FACTORS = COST_PROJECTION_SETS["default"]
 # SCENARIO DEFINITIONS
 # ============================================================================
 
+# Fuel price trajectories
+# ------------------------
+# Per-scenario fuel price modifiers: {carrier: [{"start": "YYYY-MM-DD",
+# "end": "YYYY-MM-DD", "multiplier": float}, ...]}.
+# Each modifier multiplies the carrier's MARGINAL_COSTS base price across the
+# inclusive date range. Multiple modifiers compound (overlaps stack).
+# Omit the key (or set to None) to keep the static base price.
+
 SCENARIOS = {
     "base": {
         "description": "Base case — current diesel + RE investment allowed",
-        "diesel_price_factor": 1.0,
+        "fuel_price_trajectories": None,
         "demand_growth_rate": 0.03,
         "allowed_generators": ["solar", "wind_onshore", "battery", "diesel"],
         "cost_projection": "default",
     },
     "high_diesel": {
-        "description": "Diesel price doubles by 2035",
-        "diesel_price_factor": 2.0,
-        "diesel_price_ramp_year": 2035,
+        "description": "Diesel price doubles from 2030, holds 2x through 2045",
+        "fuel_price_trajectories": {
+            "diesel": [
+                {"start": "2030-01-01", "end": "2045-12-31", "multiplier": 2.0},
+            ],
+        },
         "demand_growth_rate": 0.03,
         "allowed_generators": ["solar", "wind_onshore", "battery", "diesel"],
         "cost_projection": "default",
     },
     "solar_only": {
         "description": "Only solar + battery investment allowed (no new wind)",
-        "diesel_price_factor": 1.0,
+        "fuel_price_trajectories": None,
         "demand_growth_rate": 0.03,
         "allowed_generators": ["solar", "battery", "diesel"],
         "cost_projection": "default",
     },
     "high_growth": {
         "description": "5% annual demand growth",
-        "diesel_price_factor": 1.0,
+        "fuel_price_trajectories": None,
         "demand_growth_rate": 0.05,
         "allowed_generators": ["solar", "wind_onshore", "battery", "diesel"],
         "cost_projection": "default",
     },
     "wind_solar_battery": {
         "description": "Full RE portfolio — solar, wind, and battery",
-        "diesel_price_factor": 1.0,
+        "fuel_price_trajectories": None,
         "demand_growth_rate": 0.03,
         "allowed_generators": ["solar", "wind_onshore", "battery", "diesel"],
         "cost_projection": "default",
     },
+}
+
+# ============================================================================
+# VRE TRACE SOURCE
+# ============================================================================
+# VRE_TRACE_SOURCE selects how solar/wind capacity-factor traces are built:
+#   "renewables_ninja" — load pre-downloaded hourly CSVs from data/ and tile
+#                        them across the model horizon (existing behaviour).
+#   "atlite"           — download an ERA5 cutout via the CDS API for the
+#                        Timor-Leste bbox and compute per-bus solar PV and
+#                        wind capacity factors for each substation/power-plant
+#                        coordinate.
+#
+# atlite mode requires:
+#   1. `pip install atlite cdsapi` (already in this env).
+#   2. A CDS API key at ~/.cdsapirc — see https://cds.climate.copernicus.eu/api-how-to.
+
+VRE_TRACE_SOURCE = "renewables_ninja"
+
+ATLITE_CONFIG = {
+    # On-disk cache for ERA5 cutouts. Cutout filenames are derived from the
+    # weather year range — re-runs reuse a cached file if present.
+    "cutout_dir": r"data\cutouts",
+    "cutout_name_template": "timor_leste_{year_start}_{year_end}.nc",
+
+    # Bounding box covering Timor-Leste with a small buffer for spatial
+    # interpolation at coastal substations.
+    "bbox": {"x_min": 124.0, "x_max": 127.5, "y_min": -9.6, "y_max": -8.1},
+
+    # Module that supplies weather data for the cutout.
+    "module": "era5",
+
+    # Format for the temporary ERA5 files atlite downloads. "netcdf" avoids
+    # the ecCodes C library dependency (which is non-trivial on Windows).
+    # Use "grib" only if you have eccodes properly installed.
+    "data_format": "netcdf",
+
+    # CDS-API tuning. Recent CDS server limits reject large single-request
+    # downloads even for small bboxes. monthly_requests splits each year into
+    # 12 monthly requests, which usually stays under the cost limit.
+    "monthly_requests": True,
+    "concurrent_requests": False,
+    "show_progress": True,
+
+    # Weather years to pull. If the model horizon exceeds `weather_max_years`,
+    # the cutout is repeated from `weather_start_year` again (wrap-around).
+    "weather_start_year": 2010,
+    "weather_max_years": 15,
+
+    # Tech specs — None ⇒ use atlite's defaults.
+    "solar_panel": "CSi",
+    "solar_orientation": {"slope": 30.0, "azimuth": 180.0},
+    "wind_turbine": "Vestas_V112_3MW",
+}
+
+# ============================================================================
+# LOAD PROFILE CONFIGURATION
+# ============================================================================
+# LOAD_MODE selects how per-bus hourly load is built:
+#   "csv"    — read data/timor_leste_hourly_load_2025.csv, tile across years
+#              with compound demand growth (existing behaviour).
+#   "random" — synthesise a typical daily shape with morning + evening peaks,
+#              add Gaussian noise, apply seasonal factors, and scale per bus
+#              by load_distribution. Same daily profile is reused every day.
+#              Demand growth is NOT applied in this mode.
+
+LOAD_MODE = "csv"
+
+# Settings used only when LOAD_MODE == "random".
+# system-level peak/min are scaled per bus by the load_distribution shares
+# in timor_leste_config.add_loads_to_network / build_multiperiod_network.
+LOAD_RANDOM_CONFIG = {
+    "peak_mw": 110.0,                  # system-wide peak (MW) before scaling per bus
+    "min_mw": 35.0,                    # system-wide overnight min (MW)
+    "seed": 42,                        # integer seed for np.random.SeedSequence
+
+    # Daily shape: two cosine bumps over a min-MW baseline.
+    # Window is inclusive on both ends, hours of day (0–23).
+    "morning_peak_window": (6, 9),     # 06:00–09:00
+    "evening_peak_window": (17, 21),   # 17:00–21:00
+    "morning_peak_fraction": 0.7,      # fraction of (peak − min) reached at morning peak
+    "evening_peak_fraction": 1.0,      # 1.0 = full peak in evening
+
+    # Buses listed here use 24 fully random hourly values (uniform between
+    # min_mw and peak_mw) instead of the typical-shape template, then go
+    # through the same seasonal/noise/scaling pipeline as the others.
+    "fully_random_buses": [],
+
+    # Seasonal multiplier applied to every timestep based on its month.
+    # Default uses meteorological seasons (DJF/MAM/JJA/SON).
+    "seasonal_factors": {
+        "DJF": 1.05,   # Dec–Feb (Timor-Leste wet season)
+        "MAM": 1.00,   # Mar–May
+        "JJA": 0.92,   # Jun–Aug (dry season, cooler)
+        "SON": 0.98,   # Sep–Nov
+    },
+
+    # Gaussian noise std as a fraction of peak_mw, added per timestep.
+    "noise_std": 0.05,
 }
 
 # ============================================================================
