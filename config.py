@@ -11,8 +11,8 @@ from pypsa.common import annuity
 # ============================================================================
 
 MODEL_START_YEAR = 2026
-MODEL_END_YEAR = 2046   # exclusive right boundary — last investment period is MODEL_END_YEAR - 1
-INVESTMENT_PERIODS = list(range(2026, 2046))   # 2026 through 2045 inclusive
+MODEL_END_YEAR = 2047   # exclusive right boundary — last investment period is MODEL_END_YEAR - 1
+INVESTMENT_PERIODS = list(range(2026, 2047))   # 2026 through 2046 inclusive
 FREQ = "1h"
 
 # ============================================================================
